@@ -115,8 +115,7 @@ impl NettVpn {
                 self.library.effects = effects;
                 self.library.motion = motion;
                 if let Some(settings) = &mut self.settings {
-                    settings.draft.effects = effects;
-                    settings.draft.motion = motion;
+                    settings.accept_display(effects, motion);
                 }
                 self.message = "DISPLAY SETTINGS SAVED".into();
             }
@@ -130,8 +129,8 @@ impl NettVpn {
                 self.config = active.as_ref().map(|a| a.0.clone());
                 self.protocol = active.as_ref().map(|a| a.1);
                 self.connected = active.is_some_and(|a| a.2);
-                if self.settings.is_some() {
-                    self.settings = Some(settings::Settings::new(library.clone()));
+                if let Some(settings) = &mut self.settings {
+                    settings.accept_saved(library.clone());
                 }
                 self.library = library;
             }
@@ -580,11 +579,6 @@ impl NettVpn {
                             let previous = self.library.clone();
                             self.start(ctx, "SAVING SETTINGS...", move || {
                                 ensure_editable(&previous)?;
-                                for profile in &library.profiles {
-                                    if profile.split() {
-                                        split::configuration(profile)?;
-                                    }
-                                }
                                 library.save()?;
                                 let mut warning = None;
                                 for removed in previous.profiles.iter().filter(|old| {
@@ -610,7 +604,8 @@ impl NettVpn {
                                 }
                                 let mut result = library_completion(library)?;
                                 if let Completion::Library(_, _, notice) = &mut result {
-                                    *notice = warning;
+                                    *notice =
+                                        Some(warning.unwrap_or_else(|| "SETTINGS SAVED".into()));
                                 }
                                 Ok(result)
                             });
@@ -638,7 +633,7 @@ impl NettVpn {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        RichText::new("WINDOWS - BUILD 0.2")
+                                        RichText::new("WINDOWS - BUILD 0.2.4")
                                             .font(FontId::monospace(11.0))
                                             .color(DIM),
                                     );
@@ -907,6 +902,45 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_operation_preserves_rules_and_unsaved_draft() {
+        let mut app = super::NettVpn::default();
+        app.library.profiles.push(super::profiles::Profile {
+            id: "test".into(),
+            name: "home".into(),
+            config: "[Interface]\nJc=4\nDisableCookies=".into(),
+            sites: super::profiles::Rules {
+                enabled: true,
+                mode: super::profiles::Mode::Direct,
+                entries: vec!["example.com".into()],
+            },
+            apps: super::profiles::Rules {
+                enabled: true,
+                mode: super::profiles::Mode::Direct,
+                entries: vec![r"C:\Apps\ShairportQt.exe".into()],
+            },
+        });
+        app.library.selected = Some("test".into());
+        let saved = app.library.clone();
+        app.settings = Some(super::settings::Settings::new(saved.clone()));
+        app.settings
+            .as_mut()
+            .unwrap()
+            .draft
+            .selected_mut()
+            .unwrap()
+            .sites
+            .entries
+            .push("192.168.10.0/24".into());
+        let draft = app.settings.as_ref().unwrap().draft.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err("ENGINE FAILED".into())).unwrap();
+        app.pending = Some(rx);
+        app.poll();
+        assert!(app.library == saved);
+        assert!(app.settings.as_ref().unwrap().draft == draft);
+        assert!(!app.connected);
+    }
     fn ui_frame(
         app: &mut super::NettVpn,
         ctx: &super::egui::Context,
@@ -1030,6 +1064,14 @@ mod tests {
         assert!(!app.settings.as_ref().unwrap().draft.effects);
         let output = ui_frame(&mut app, &ctx, vec![]);
         click(&mut app, &ctx, text_rect(&output, "< BACK").center());
+        assert!(app.settings.is_some());
+        let output = ui_frame(&mut app, &ctx, vec![]);
+        text_rect(&output, "UNSAVED CHANGES");
+        click(
+            &mut app,
+            &ctx,
+            text_rect(&output, "DISCARD & BACK").center(),
+        );
         assert!(app.settings.is_none());
     }
 

@@ -219,8 +219,9 @@ pub fn configuration(profile: &Profile) -> Result<Value, String> {
                 if awg =>
             {
                 let flag = match value.to_ascii_lowercase().as_str() {
-                    "true" | "1" => true,
-                    "false" | "0" => false,
+                    "" => continue, // AWG optional empty fields are unset, not invalid booleans.
+                    "true" | "t" | "1" | "on" | "yes" => true,
+                    "false" | "f" | "0" | "off" | "no" => false,
                     _ => return Err(format!("INVALID BOOLEAN: {key}")),
                 };
                 endpoint[if key.starts_with("random") {
@@ -258,8 +259,28 @@ pub fn configuration(profile: &Profile) -> Result<Value, String> {
                     }] = json!(value)
                 }
                 "persistentkeepalive" => {
-                    p["persistent_keepalive_interval"] =
-                        json!(value.parse::<u16>().map_err(|_| "INVALID KEEPALIVE")?)
+                    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("(off)") {
+                        p["persistent_keepalive_interval"] = json!(0);
+                    } else if awg && value.contains('-') {
+                        let (min, max) = value.split_once('-').unwrap();
+                        let min = min
+                            .trim()
+                            .parse::<u16>()
+                            .map_err(|_| "INVALID KEEPALIVE RANGE")?;
+                        let max = max
+                            .trim()
+                            .parse::<u16>()
+                            .map_err(|_| "INVALID KEEPALIVE RANGE")?;
+                        if min > max {
+                            return Err("INVALID KEEPALIVE RANGE: MIN EXCEEDS MAX".into());
+                        }
+                        p["persistent_keepalive_range"] = json!(format!("{min}-{max}"));
+                    } else {
+                        p["persistent_keepalive_interval"] =
+                            json!(value.parse::<u16>().map_err(
+                                |_| "INVALID KEEPALIVE: EXPECTED 0..65535 OR AWG RANGE"
+                            )?);
+                    }
                 }
                 _ => return Err(format!("UNSUPPORTED PEER FIELD: {key}")),
             }
@@ -373,6 +394,32 @@ pub fn running(path: &Path) -> bool {
     }
 }
 
+fn resolve_awg_endpoints(options: &mut Value) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    for endpoint in options["endpoints"]
+        .as_array_mut()
+        .ok_or("ENDPOINTS MISSING")?
+    {
+        if endpoint["type"] != "awg" {
+            continue;
+        }
+        for peer in endpoint["peers"].as_array_mut().ok_or("PEERS MISSING")? {
+            let host = peer["address"].as_str().ok_or("PEER ADDRESS MISSING")?;
+            if host.parse::<std::net::Ipv4Addr>().is_ok() {
+                continue;
+            }
+            let port = peer["port"].as_u64().ok_or("PEER PORT MISSING")? as u16;
+            let address = (host, port)
+                .to_socket_addrs()
+                .map_err(|_| "VPN SERVER DNS LOOKUP FAILED - CHECK DIRECT INTERNET AND DNS")?
+                .find(|address| address.is_ipv4())
+                .ok_or("SPLIT AWG SERVER HAS NO IPV4 ADDRESS")?;
+            peer["address"] = json!(address.ip().to_string());
+        }
+    }
+    Ok(())
+}
+
 pub fn start(profile: &Profile) -> Result<(), String> {
     if profile.apps.enabled
         && profile
@@ -388,7 +435,8 @@ pub fn start(profile: &Profile) -> Result<(), String> {
         return Err("SPLIT TUNNEL ALREADY RUNNING".into());
     }
     let engine = engine()?;
-    let options = configuration(profile)?;
+    let mut options = configuration(profile)?;
+    resolve_awg_endpoints(&mut options)?;
     let config = path.with_extension("split.json");
     std::fs::write(
         &config,
@@ -469,11 +517,29 @@ mod tests {
             .join(r"engines\AmneziaBox\nett-split-core.exe");
         let root = std::env::temp_dir().join(format!("nett-box-check-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        for awg in [false, true] {
+        for (awg, flag) in [
+            (false, ""),
+            (true, ""),
+            (true, "on"),
+            (true, "off"),
+            (true, "yes"),
+            (true, "no"),
+        ] {
             let mut profile = fixture();
             if awg {
-                profile.config=profile.config.replace("[Interface]","[Interface]\nJc=4\nJmin=40\nJmax=70\nS1=10\nS2=20\nH1=123456\nH2=234567\nH3=345678\nH4=456789");
+                profile.config=profile.config.replace("[Interface]","[Interface]\nJc=4\nJmin=40\nJmax=70\nS1=10\nS2=20\nH1=123456\nH2=234567\nH3=345678\nH4=456789\nDisableCookies=\nRandomTrailers=\nHeaderProtectionKey=\nContentPaddingAddition=\nRekeyAfterTime=\nRekeyTimeout=\nRejectAfterTime=\nKeepaliveTimeout=\nMaxHandshakeAttempts=");
             }
+            if awg && !flag.is_empty() {
+                profile.config = profile
+                    .config
+                    .replace("DisableCookies=\n", &format!("DisableCookies={flag}\n"))
+                    .replace("RandomTrailers=\n", &format!("RandomTrailers={flag}\n"));
+            }
+            profile.config.push_str(if awg {
+                "\nPersistentKeepalive=25-35"
+            } else {
+                "\nPersistentKeepalive=25"
+            });
             let mut config = super::configuration(&profile).unwrap();
             config["log"] = serde_json::json!({"disabled":true});
             let path = root.join("test.json");
@@ -486,11 +552,50 @@ mod tests {
                 .unwrap();
             assert!(
                 result.status.success(),
-                "awg={awg}: {}",
+                "awg={awg}, flag={flag}: {}",
                 String::from_utf8_lossy(&result.stderr)
             );
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn awg_optional_booleans_accept_client_config_forms() {
+        for (value, expected) in [
+            ("", None),
+            (" ", None),
+            ("false", Some(false)),
+            ("0", Some(false)),
+            ("F", Some(false)),
+            ("TRUE", Some(true)),
+            ("1", Some(true)),
+            ("t", Some(true)),
+            ("on", Some(true)),
+            ("ON", Some(true)),
+            ("off", Some(false)),
+            ("OFF", Some(false)),
+            ("yes", Some(true)),
+            ("no", Some(false)),
+        ] {
+            let mut profile = fixture();
+            profile.config = profile.config.replace(
+                "[Interface]",
+                &format!("[Interface]\nJc=4\nDisableCookies={value}\nRandomTrailers={value}"),
+            );
+            let config = super::configuration(&profile).unwrap();
+            for field in ["disable_cookies", "random_trailers"] {
+                assert_eq!(
+                    config["endpoints"][0].get(field).and_then(|v| v.as_bool()),
+                    expected,
+                    "{field}"
+                );
+            }
+        }
+        let mut profile = fixture();
+        profile.config = profile
+            .config
+            .replace("[Interface]", "[Interface]\nJc=4\nDisableCookies=invalid");
+        assert!(super::configuration(&profile).is_err());
     }
 
     #[test]
@@ -503,9 +608,20 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("test.conf");
         let config = root.join("test.json");
+        let mut profile = fixture();
+        profile.config = profile.config.replace(
+            "[Interface]",
+            "[Interface]\nJc=4\nDisableCookies=on\nRandomTrailers=on",
+        );
+        profile.config = profile.config.replace("127.0.0.1:51820", "localhost:51820");
+        profile.config.push_str("\nPersistentKeepalive=25-35");
+        let mut options = super::configuration(&profile).unwrap();
+        super::resolve_awg_endpoints(&mut options).unwrap();
+        let endpoints = options["endpoints"].clone();
+        // No TUN inbound or auto_route: exercise AWG startup without changing host routes.
         std::fs::write(
             &config,
-            br#"{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}]}"#,
+            serde_json::to_vec(&serde_json::json!({"log":{"disabled":true},"endpoints":endpoints,"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}})).unwrap(),
         )
         .unwrap();
         let mut child = std::process::Command::new(engine)
@@ -536,6 +652,64 @@ mod tests {
         assert!(!super::running(&path));
         assert!(!path.with_extension("ready.json").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn awg_hostname_is_resolved_without_changing_saved_config() {
+        for host in ["localhost", "127.0.0.1"] {
+            let mut profile = fixture();
+            profile.config = profile
+                .config
+                .replace("[Interface]", "[Interface]\nJc=4")
+                .replace("127.0.0.1:51820", &format!("{host}:51820"));
+            let original = profile.config.clone();
+            let mut options = super::configuration(&profile).unwrap();
+            super::resolve_awg_endpoints(&mut options).unwrap();
+            assert_eq!(options["endpoints"][0]["peers"][0]["address"], "127.0.0.1");
+            assert_eq!(options["endpoints"][0]["peers"][0]["port"], 51820);
+            assert_eq!(profile.config, original);
+        }
+        let mut options = super::configuration(&fixture()).unwrap();
+        options["endpoints"][0]["peers"][0]["address"] = serde_json::json!("unchanged.invalid");
+        super::resolve_awg_endpoints(&mut options).unwrap();
+        assert_eq!(
+            options["endpoints"][0]["peers"][0]["address"],
+            "unchanged.invalid"
+        );
+    }
+    #[test]
+    fn keepalive_preserves_awg_ranges_and_validates_bounds() {
+        for awg in [false, true] {
+            for (value, valid) in [
+                ("0", true),
+                ("25", true),
+                ("65535", true),
+                ("off", true),
+                ("(off)", true),
+                ("25-35", awg),
+                ("35-25", false),
+                ("25-65536", false),
+                ("-1", false),
+                ("", false),
+                ("25-x", false),
+                ("25-35-40", false),
+            ] {
+                let mut profile = fixture();
+                if awg {
+                    profile.config = profile.config.replace("[Interface]", "[Interface]\nJc=4");
+                }
+                profile
+                    .config
+                    .push_str(&format!("\nPersistentKeepalive={value}"));
+                let result = super::configuration(&profile);
+                assert_eq!(result.is_ok(), valid, "awg={awg}, value={value}");
+                if awg && value == "25-35" {
+                    assert_eq!(
+                        result.unwrap()["endpoints"][0]["peers"][0]["persistent_keepalive_range"],
+                        "25-35"
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn addresses_ports_and_invalid_rules() {

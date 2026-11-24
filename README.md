@@ -10,7 +10,7 @@
           [ tunnel terminal / windows x64 ]
 ```
 
-![build](https://img.shields.io/badge/build-0.2.0-9cff44?style=flat-square&labelColor=141d18)
+![build](https://img.shields.io/badge/build-0.2.4-9cff44?style=flat-square&labelColor=141d18)
 ![Rust](https://img.shields.io/badge/client-Rust-9cff44?style=flat-square&labelColor=141d18&logo=rust)
 ![Windows](https://img.shields.io/badge/platform-Windows_x64-9cff44?style=flat-square&labelColor=141d18)
 ![WG + AWG](https://img.shields.io/badge/tunnels-WireGuard_%2B_AmneziaWG-9cff44?style=flat-square&labelColor=141d18)
@@ -34,7 +34,7 @@ No browser shell. No Go installation needed to run it. VPN engines live beside t
 ## 01 // b00t
 
 ```text
-> download  nett-v0.2.0-windows-x64.zip
+> download  nett-v0.2.4-windows-x64.zip
 > extract   the whole archive
 > launch    nett.exe
 > import    your .conf
@@ -64,13 +64,13 @@ Before upgrading, exit the previous copy through `qu1t`. Do not run two Nett ins
 | `SITES` / `APPS` | Configure split routing for the selected profile |
 | `DISPLAY` | Change CRT effects and animation, even with VPN active |
 | `SAVE & APPLY` | Save settings; `DISPLAY` saves display preferences only |
-| `BACK` | Discard unsaved changes |
+| `BACK` | Return; confirm before discarding unsaved changes |
 | `F8` | Toggle CRT effects immediately |
 | `HIDE` / `CLOSE` | Hide the window; keep the tunnel running |
 | Tray → `s33` | Restore the window |
 | Tray → `qu1t` | Stop the tunnel, then exit |
 
-Profile and routing edits are locked while connected. Display preferences are saved independently and do not restart the VPN. Importing a profile also saves the current draft.
+Profile and routing edits are locked while connected. Display preferences are saved independently and do not restart the VPN. Importing a profile also saves the current draft. Split lists are saved independently of engine validation; a connection error never clears saved rules. Successful saves retain the current settings tab. AWG boolean fields support on/off, yes/no, true/false and 1/0; empty optional fields are treated as unset. AWG PersistentKeepalive ranges such as 25-35 are preserved by the bundled split core; off disables keepalive.
 
 The tray **k** is white when inactive and green when an engine is running. `wired` reports engine state, not a verified remote handshake. A failed disconnect or cancelled UAC leaves Nett open with an error instead of silently exiting.
 
@@ -101,7 +101,7 @@ Routing limits:
 - Peer `AllowedIPs` still apply. A local rule cannot grant access beyond the peer configuration.
 - Domain matching uses intercepted DNS or protocol sniffing. App-owned encrypted DNS and ECH can hide the domain; use IP/CIDR rules or adjust secure DNS in that app.
 - VPN DNS uses the first IP in the profile DNS list, or `1.1.1.1` when none exists. Direct DNS uses Windows. Shared Windows DNS services are not isolated per app.
-- The split AWG server endpoint currently needs an IPv4 address or hostname. Unsupported config fields fail explicitly.
+- The split AWG server endpoint needs an IPv4 address or hostname with an IPv4 DNS record. Nett resolves hostnames through Windows DNS before each connection, in the background. Unsupported config fields fail explicitly.
 
 ## 04 // l0cal vault
 

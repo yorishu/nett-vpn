@@ -8,7 +8,7 @@ pub enum Mode {
     Direct,
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct Rules {
     pub enabled: bool,
@@ -16,7 +16,7 @@ pub struct Rules {
     pub entries: Vec<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
     pub id: String,
     pub name: String,
@@ -58,7 +58,7 @@ impl Profile {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Library {
     pub profiles: Vec<Profile>,
@@ -233,5 +233,36 @@ mod tests {
         assert_eq!(copy.selected().unwrap().config, "secret");
         library.profiles[0].id = "../escape".into();
         assert!(library.validate().is_err());
+    }
+
+    #[test]
+    fn routing_lists_can_be_saved_even_when_engine_rejects_config() {
+        let root = std::env::temp_dir().join(format!("nett-rule-save-test-{}", std::process::id()));
+        let mut library = super::Library::default();
+        library.profiles.push(super::Profile {
+            id: "test".into(),
+            name: "home".into(),
+            config: "[Interface]\nJc=4\nDisableCookies=invalid".into(),
+            sites: super::Rules {
+                enabled: true,
+                mode: super::Mode::Direct,
+                entries: vec!["example.com".into(), "192.168.10.0/24".into()],
+            },
+            apps: super::Rules {
+                enabled: true,
+                mode: super::Mode::Direct,
+                entries: vec![r"C:\Apps\ShairportQt.exe".into()],
+            },
+        });
+        library.selected = Some("test".into());
+        assert!(crate::split::configuration(library.selected().unwrap()).is_err());
+        library.save_at(&root).unwrap();
+        let bytes = std::fs::read(root.join("profiles.dpapi")).unwrap();
+        let restored: super::Library =
+            serde_json::from_slice(&crate::storage::crypt(&bytes, false).unwrap()).unwrap();
+        assert!(restored == library);
+        assert_eq!(restored.selected().unwrap().sites.entries.len(), 2);
+        assert_eq!(restored.selected().unwrap().apps.entries.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

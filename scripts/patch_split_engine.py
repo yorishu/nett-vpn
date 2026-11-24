@@ -1,9 +1,23 @@
-"""Apply the small Windows lifecycle extension to the pinned official source."""
+"""Apply Nett lifecycle, naming and AWG keepalive range support to pinned source."""
 from pathlib import Path
 import shutil
 import sys
 
 root = Path(sys.argv[1])
+path = root / 'option/awg.go'
+text = path.read_text()
+if 'PersistentKeepaliveRange' not in text:
+    needle = '\tPersistentKeepaliveInterval uint16'
+    assert text.count(needle) == 1
+    text = text.replace(needle, '\tPersistentKeepaliveRange string `json:"persistent_keepalive_range,omitempty"`\n' + needle)
+    path.write_text(text)
+path = root / 'protocol/awg/endpoint.go'
+text = path.read_text()
+if 'peer.PersistentKeepaliveRange' not in text:
+    needle = '\t\tif peer.PersistentKeepaliveInterval != 0 {'
+    assert text.count(needle) == 1
+    text = text.replace(needle, '\t\tif peer.PersistentKeepaliveRange != "" {\n\t\t\ts += "\\npersistent_keepalive_interval=" + peer.PersistentKeepaliveRange\n\t\t} else if peer.PersistentKeepaliveInterval != 0 {')
+    path.write_text(text)
 target = root / 'cmd/sing-box/cmd_run.go'
 text = target.read_text()
 if 'nettWatch' not in text:

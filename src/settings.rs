@@ -21,6 +21,8 @@ pub enum Action {
 
 pub struct Settings {
     pub draft: Library,
+    saved: Library,
+    confirm_discard: bool,
     page: Page,
     input: String,
     error: String,
@@ -41,11 +43,31 @@ impl Settings {
     }
     pub fn new(draft: Library) -> Self {
         Self {
+            saved: draft.clone(),
+            confirm_discard: false,
             draft,
             page: Page::Profiles,
             input: String::new(),
             error: String::new(),
             delete: None,
+        }
+    }
+
+    pub fn accept_saved(&mut self, library: Library) {
+        self.saved = library.clone();
+        self.draft = library;
+        self.error.clear();
+        self.delete = None;
+        self.confirm_discard = false;
+    }
+
+    pub fn accept_display(&mut self, effects: bool, motion: bool) {
+        self.saved.effects = effects;
+        self.saved.motion = motion;
+        self.draft.effects = effects;
+        self.draft.motion = motion;
+        if self.draft == self.saved {
+            self.confirm_discard = false;
         }
     }
 
@@ -66,7 +88,11 @@ impl Settings {
         let mut action = None;
         ui.horizontal(|ui| {
             if ui.button(RichText::new("< BACK").monospace()).clicked() {
-                action = Some(Action::Close);
+                if self.draft == self.saved {
+                    action = Some(Action::Close);
+                } else {
+                    self.confirm_discard = true;
+                }
             }
             ui.label(
                 RichText::new("settings / control deck")
@@ -221,6 +247,25 @@ impl Settings {
                 .color(DIM),
             );
         });
+        if self.confirm_discard {
+            egui::Modal::new(egui::Id::new("unsaved-settings")).show(ui.ctx(), |ui| {
+                ui.label(
+                    RichText::new("UNSAVED CHANGES")
+                        .monospace()
+                        .color(LIME)
+                        .strong(),
+                );
+                ui.label("Use SAVE & APPLY to keep your profile and routing edits.");
+                ui.horizontal(|ui| {
+                    if ui.button("KEEP EDITING").clicked() {
+                        self.confirm_discard = false;
+                    }
+                    if ui.button("DISCARD & BACK").clicked() {
+                        action = Some(Action::Close);
+                    }
+                });
+            });
+        }
         action
     }
 }
@@ -246,6 +291,21 @@ fn entries(ui: &mut egui::Ui, rules: &mut Rules) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saving_keeps_current_tab_and_clears_dirty_state() {
+        let mut settings = super::Settings::new(Default::default());
+        settings.page = super::Page::Apps;
+        settings.draft.motion = false;
+        settings.confirm_discard = true;
+        let saved = settings.draft.clone();
+        settings.accept_saved(saved.clone());
+        assert!(settings.page == super::Page::Apps);
+        assert!(settings.draft == saved && settings.saved == saved);
+        assert!(!settings.confirm_discard);
+        settings.draft.effects = false;
+        settings.accept_display(false, false);
+        assert!(settings.draft == settings.saved);
+    }
     #[test]
     fn animation_can_be_edited_and_saved_while_vpn_is_active() {
         let ctx = crate::egui::Context::default();

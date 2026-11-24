@@ -23,5 +23,5 @@ $env:GOTOOLCHAIN = 'local'
 $env:GOWORK = 'off'
 $env:CGO_ENABLED = '0'
 Set-Location $nettSource
-& $nettGo.Source build -trimpath -tags with_gvisor,with_awg,with_wireguard,with_conntrack -ldflags '-s -w -X github.com/sagernet/sing-box/constant.Version=1.260910.0-nett.1' -o $nettOutput ./cmd/sing-box
+& $nettGo.Source build -trimpath -tags with_gvisor,with_awg,with_wireguard,with_conntrack -ldflags '-s -w -X github.com/sagernet/sing-box/constant.Version=1.260910.0-nett.2' -o $nettOutput ./cmd/sing-box
 if ($LASTEXITCODE -ne 0) { throw 'Split core build failed' }
