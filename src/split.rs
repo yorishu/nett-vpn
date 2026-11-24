@@ -1,0 +1,574 @@
+use crate::profiles::{Mode, Profile, Rules};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    net::IpAddr,
+    os::windows::process::CommandExt,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant},
+};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, FILETIME},
+    System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        WaitForSingleObject,
+    },
+};
+
+pub fn site(raw: &str) -> Result<Value, String> {
+    let raw = raw.trim();
+    if let Some((ip, prefix)) = raw.split_once('/') {
+        let ip: IpAddr = ip.parse().map_err(|_| "INVALID CIDR ADDRESS")?;
+        let n: u8 = prefix.parse().map_err(|_| "INVALID CIDR PREFIX")?;
+        if n > if ip.is_ipv4() { 32 } else { 128 } {
+            return Err("INVALID CIDR PREFIX".into());
+        }
+        return Ok(json!({"ip_cidr":[format!("{ip}/{n}")]}));
+    }
+    if let Ok(ip) = raw.parse::<IpAddr>() {
+        return Ok(json!({"ip_cidr":[format!("{ip}/{}", if ip.is_ipv4(){32}else{128})]}));
+    }
+    let (host, port) = if let Ok(addr) = raw.parse::<std::net::SocketAddr>() {
+        (addr.ip().to_string(), Some(addr.port()))
+    } else if let Some((host, port)) = raw.rsplit_once(':') {
+        (
+            host.to_owned(),
+            Some(port.parse::<u16>().map_err(|_| "INVALID PORT")?),
+        )
+    } else {
+        (raw.to_owned(), None)
+    };
+    if port == Some(0) {
+        return Err("PORT MUST BE 1-65535".into());
+    }
+    let mut result = if let Ok(ip) = host.parse::<IpAddr>() {
+        json!({"ip_cidr":[format!("{ip}/{}", if ip.is_ipv4(){32}else{128})]})
+    } else {
+        let host = host
+            .strip_prefix("*.")
+            .unwrap_or(&host)
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if host.len() > 253
+            || host.is_empty()
+            || !host.split('.').all(|s| {
+                !s.is_empty()
+                    && s.len() <= 63
+                    && !s.starts_with('-')
+                    && !s.ends_with('-')
+                    && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        {
+            return Err("ENTER A DOMAIN, IP, CIDR OR HOST:PORT".into());
+        }
+        json!({"domain_suffix":[host]})
+    };
+    if let Some(port) = port {
+        result["port"] = json!([port]);
+    }
+    Ok(result)
+}
+
+pub fn validate_rules(rules: &Rules, apps: bool) -> Result<(), String> {
+    if rules.entries.len() > 200 {
+        return Err("MAXIMUM 200 RULES PER LIST".into());
+    }
+    if rules.enabled && rules.entries.is_empty() {
+        return Err("ADD A RULE BEFORE ENABLING THE LIST".into());
+    }
+    let mut unique = std::collections::HashSet::new();
+    for entry in &rules.entries {
+        if !unique.insert(entry.to_ascii_lowercase()) {
+            return Err("DUPLICATE SPLIT RULE".into());
+        }
+        if apps {
+            if !Path::new(entry).is_absolute()
+                || !entry.to_ascii_lowercase().ends_with(".exe")
+                || entry.chars().any(char::is_control)
+            {
+                return Err("SELECT A FULL .EXE PATH".into());
+            }
+        } else {
+            site(entry)?;
+        }
+    }
+    Ok(())
+}
+
+fn process_pattern(path: &str) -> String {
+    let mut pattern = String::from("(?i)^");
+    for c in path.chars() {
+        if "\\.+*?()[]{}^$|".contains(c) {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('$');
+    pattern
+}
+
+pub fn configuration(profile: &Profile) -> Result<Value, String> {
+    validate_rules(&profile.sites, false)?;
+    validate_rules(&profile.apps, true)?;
+    let mut interface = BTreeMap::new();
+    let mut peers: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut section = 0;
+    for raw in profile.config.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.eq_ignore_ascii_case("[Interface]") {
+            section = 1;
+            continue;
+        }
+        if line.eq_ignore_ascii_case("[Peer]") {
+            section = 2;
+            peers.push(BTreeMap::new());
+            continue;
+        }
+        if line.starts_with('[') {
+            return Err("UNSUPPORTED CONFIG SECTION".into());
+        }
+        let (key, value) = line.split_once('=').ok_or("INVALID CONFIG LINE")?;
+        let key = key.trim().to_ascii_lowercase();
+        let target = if section == 1 {
+            &mut interface
+        } else if section == 2 {
+            peers.last_mut().unwrap()
+        } else {
+            return Err("CONFIG VALUE OUTSIDE A SECTION".into());
+        };
+        if target
+            .insert(key.clone(), value.trim().to_owned())
+            .is_some()
+        {
+            return Err(format!("DUPLICATE CONFIG FIELD: {key}"));
+        }
+    }
+    let list = |value: Option<&String>| -> Vec<String> {
+        value
+            .map(|s| {
+                s.split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let awg = profile.protocol() == crate::Protocol::AmneziaWg;
+    let mut endpoint = json!({"type":if awg{"awg"}else{"wireguard"},"tag":"vpn","address":list(interface.get("address")),"private_key":interface.get("privatekey").ok_or("PRIVATE KEY MISSING")?});
+    if endpoint["address"].as_array().is_none_or(|a| a.is_empty()) {
+        return Err("ADDRESS IS REQUIRED FOR SPLIT TUNNELING".into());
+    }
+    if awg {
+        endpoint["useIntegratedTun"] = json!(false);
+    } else {
+        endpoint["system"] = json!(false);
+    }
+    for (key, value) in &interface {
+        match key.as_str() {
+            "address" | "privatekey" | "dns" => (),
+            "mtu" | "listenport" => {
+                endpoint[if key == "listenport" {
+                    "listen_port"
+                } else {
+                    "mtu"
+                }] = json!(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| "INVALID MTU OR LISTEN PORT")?
+                );
+            }
+            "jc" | "jmin" | "jmax" | "s1" | "s2" | "s3" | "s4" if awg => {
+                endpoint[key] = json!(value.parse::<u32>().map_err(|_| format!("INVALID {key}"))?);
+            }
+            "h1" | "h2" | "h3" | "h4" | "i1" | "i2" | "i3" | "i4" | "i5" if awg => {
+                endpoint[key] = json!(value);
+            }
+            "headerprotectionkey"
+            | "header_protection_key"
+            | "contentpaddingaddition"
+            | "content_padding_addition"
+            | "rekeyaftertime"
+            | "rekey_after_time"
+            | "rekeytimeout"
+            | "rekey_timeout"
+            | "rejectaftertime"
+            | "reject_after_time"
+            | "keepalivetimeout"
+            | "keepalive_timeout"
+            | "maxhandshakeattempts"
+            | "max_handshake_attempts"
+                if awg =>
+            {
+                let mapped = match key.replace('_', "").as_str() {
+                    "headerprotectionkey" => "header_protection_key",
+                    "contentpaddingaddition" => "content_padding_addition",
+                    "rekeyaftertime" => "rekey_after_time",
+                    "rekeytimeout" => "rekey_timeout",
+                    "rejectaftertime" => "reject_after_time",
+                    "keepalivetimeout" => "keepalive_timeout",
+                    _ => "max_handshake_attempts",
+                };
+                endpoint[mapped] = json!(value);
+            }
+            "randomtrailers" | "random_trailers" | "disablecookie" | "disable_cookie"
+            | "disablecookies" | "disable_cookies"
+                if awg =>
+            {
+                let flag = match value.to_ascii_lowercase().as_str() {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    _ => return Err(format!("INVALID BOOLEAN: {key}")),
+                };
+                endpoint[if key.starts_with("random") {
+                    "random_trailers"
+                } else {
+                    "disable_cookies"
+                }] = json!(flag);
+            }
+            _ => return Err(format!("SPLIT ENGINE DOES NOT SUPPORT FIELD: {key}")),
+        }
+    }
+    let mut peer_options = Vec::new();
+    for peer in &peers {
+        let target = peer.get("endpoint").ok_or("PEER ENDPOINT MISSING")?;
+        let (host, port) = target.rsplit_once(':').ok_or("INVALID PEER ENDPOINT")?;
+        let port = port.parse::<u16>().map_err(|_| "INVALID PEER PORT")?;
+        if port == 0 {
+            return Err("INVALID PEER PORT".into());
+        }
+        if awg && host.starts_with('[') {
+            return Err("SPLIT AWG REQUIRES AN IPV4 OR DOMAIN ENDPOINT".into());
+        }
+        let mut p = json!({"address":host.trim_matches(['[',']']),"port":port,"public_key":peer.get("publickey").ok_or("PEER PUBLIC KEY MISSING")?,"allowed_ips":list(peer.get("allowedips"))});
+        if p["allowed_ips"].as_array().is_none_or(|a| a.is_empty()) {
+            return Err("PEER ALLOWED IPS MISSING".into());
+        }
+        for (key, value) in peer {
+            match key.as_str() {
+                "endpoint" | "publickey" | "allowedips" => (),
+                "presharedkey" => {
+                    p[if awg {
+                        "preshared_key"
+                    } else {
+                        "pre_shared_key"
+                    }] = json!(value)
+                }
+                "persistentkeepalive" => {
+                    p["persistent_keepalive_interval"] =
+                        json!(value.parse::<u16>().map_err(|_| "INVALID KEEPALIVE")?)
+                }
+                _ => return Err(format!("UNSUPPORTED PEER FIELD: {key}")),
+            }
+        }
+        peer_options.push(p);
+    }
+    if peer_options.is_empty() {
+        return Err("NO PEERS".into());
+    }
+    endpoint["peers"] = json!(peer_options);
+    let final_out = if [&profile.sites, &profile.apps]
+        .iter()
+        .any(|r| r.enabled && r.mode == Mode::ViaVpn)
+    {
+        "direct"
+    } else {
+        "vpn"
+    };
+    let mut route_rules = vec![
+        json!({"action":"sniff"}),
+        json!({"protocol":"dns","action":"hijack-dns"}),
+    ];
+    let mut dns_rules = Vec::new();
+    for mode in [Mode::Direct, Mode::ViaVpn] {
+        for (rules, apps) in [(&profile.sites, false), (&profile.apps, true)] {
+            if !rules.enabled || rules.mode != mode {
+                continue;
+            }
+            for entry in &rules.entries {
+                let mut rule = if apps {
+                    json!({"process_path_regex":[process_pattern(entry)]})
+                } else {
+                    site(entry)?
+                };
+                let target = if mode == Mode::Direct {
+                    "direct"
+                } else {
+                    "vpn"
+                };
+                let mut dns_rule = rule.clone();
+                if !apps
+                    && dns_rule.get("domain_suffix").is_some()
+                    && dns_rule.get("port").is_none()
+                {
+                    dns_rule["action"] = json!("route");
+                    dns_rule["server"] = json!(format!("dns-{target}"));
+                    dns_rules.push(dns_rule);
+                }
+                rule["action"] = json!("route");
+                rule["outbound"] = json!(target);
+                route_rules.push(rule);
+            }
+        }
+    }
+    let vpn_dns = list(interface.get("dns"))
+        .into_iter()
+        .find(|s| s.parse::<IpAddr>().is_ok())
+        .unwrap_or_else(|| "1.1.1.1".into());
+    Ok(json!({
+        "log":{"level":"warn","timestamp":true,"output":profile.path()?.with_extension("split.log")},
+        "dns":{"servers":[{"type":"local","tag":"dns-direct","detour":"direct"},{"type":"udp","tag":"dns-vpn","server":vpn_dns,"detour":"vpn"}],"rules":dns_rules,"final":format!("dns-{final_out}"),"strategy":"prefer_ipv4","reverse_mapping":true},
+        "inbounds":[{"type":"tun","tag":"tun","interface_name":format!("nett-{}",profile.id),"address":["172.30.255.1/30","fdfe:dcba:9876::1/126"],"mtu":1400,"auto_route":true,"strict_route":true,"stack":"gvisor"}],
+        "endpoints":[endpoint],"outbounds":[{"type":"direct","tag":"direct"}],
+        "route":{"auto_detect_interface":true,"find_process":profile.apps.enabled,"default_domain_resolver":"dns-direct","rules":route_rules,"final":final_out}
+    }))
+}
+
+fn engine() -> Result<PathBuf, String> {
+    let path = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .parent()
+        .ok_or("APP DIRECTORY NOT FOUND")?
+        .join(r"engines\AmneziaBox\nett-split-core.exe");
+    if !path.is_file() {
+        return Err("SPLIT ENGINE NOT FOUND - KEEP engines BESIDE nett.exe".into());
+    }
+    Ok(path)
+}
+
+#[derive(serde::Deserialize)]
+struct Ready {
+    pid: u32,
+    created: u64,
+}
+pub fn running(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path.with_extension("ready.json")) else {
+        return false;
+    };
+    let Ok(ready) = serde_json::from_slice::<Ready>(&bytes) else {
+        return false;
+    };
+    unsafe {
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            ready.pid,
+        );
+        if handle.is_null() {
+            return false;
+        }
+        let mut created: FILETIME = std::mem::zeroed();
+        let mut exit: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let ok = GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) != 0
+            && ((created.dwHighDateTime as u64) << 32 | created.dwLowDateTime as u64)
+                == ready.created
+            && WaitForSingleObject(handle, 0) == 258;
+        CloseHandle(handle);
+        ok
+    }
+}
+
+pub fn start(profile: &Profile) -> Result<(), String> {
+    if profile.apps.enabled
+        && profile
+            .apps
+            .entries
+            .iter()
+            .any(|path| !Path::new(path).is_file())
+    {
+        return Err("APPLICATION MOVED OR REMOVED - UPDATE ITS .EXE PATH IN SETTINGS".into());
+    }
+    let path = profile.path()?;
+    if running(&path) {
+        return Err("SPLIT TUNNEL ALREADY RUNNING".into());
+    }
+    let engine = engine()?;
+    let options = configuration(profile)?;
+    let config = path.with_extension("split.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec_pretty(&options).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let check = Command::new(&engine)
+        .arg("check")
+        .arg("-c")
+        .arg(&config)
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !check.status.success() {
+        std::fs::write(path.with_extension("split.log"), &check.stderr)
+            .map_err(|e| e.to_string())?;
+        return Err("SPLIT CONFIG REJECTED BY ENGINE - SEE PROFILE LOG".into());
+    }
+    let ready = path.with_extension("ready.json");
+    let stop = path.with_extension("stop");
+    for p in [&ready, &stop] {
+        match std::fs::remove_file(p) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let script = "$ErrorActionPreference='Stop'; $argsText='run -c '+[char]34+$env:NETT_CONFIG+[char]34+' --nett-ready-file '+[char]34+$env:NETT_READY+[char]34+' --nett-stop-file '+[char]34+$env:NETT_STOP+[char]34; Start-Process -FilePath $env:NETT_ENGINE -ArgumentList $argsText -Verb RunAs -WindowStyle Hidden | Out-Null";
+    let status = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("NETT_ENGINE", engine)
+        .env("NETT_CONFIG", config)
+        .env("NETT_READY", ready)
+        .env("NETT_STOP", stop)
+        .creation_flags(0x08000000)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("SPLIT START CANCELLED OR FAILED".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < deadline {
+        if running(&path) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // A late startup must see the stop request instead of becoming an untracked tunnel.
+    std::fs::write(path.with_extension("stop"), b"stop").map_err(|e| e.to_string())?;
+    Err("SPLIT ENGINE DID NOT START - SEE PROFILE LOG".into())
+}
+
+pub fn stop(path: &Path) -> Result<(), String> {
+    if !running(path) {
+        return Ok(());
+    }
+    std::fs::write(path.with_extension("stop"), b"stop").map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if !running(path) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err("SPLIT ENGINE IS STILL STOPPING - EXIT CANCELLED".into())
+}
+
+#[cfg(test)]
+mod tests {
+    fn fixture() -> crate::profiles::Profile {
+        crate::profiles::Profile {id:"fixture".into(),name:"test".into(),config:"[Interface]\nPrivateKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress=10.0.0.2/32\nDNS=1.1.1.1\n[Peer]\nPublicKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nEndpoint=127.0.0.1:51820\nAllowedIPs=0.0.0.0/0,::/0".into(),sites:crate::profiles::Rules{enabled:true,mode:crate::profiles::Mode::ViaVpn,entries:vec!["example.com".into(),"192.168.10.0/24".into(),"host.ts.net:8766".into()]},apps:crate::profiles::Rules{enabled:true,mode:crate::profiles::Mode::Direct,entries:vec![r"C:\Apps\Discord.exe".into()]}}
+    }
+
+    #[test]
+    #[ignore = "requires the compiled Amnezia Box sidecar"]
+    fn generated_configs_pass_real_engine_check() {
+        let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(r"engines\AmneziaBox\nett-split-core.exe");
+        let root = std::env::temp_dir().join(format!("nett-box-check-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for awg in [false, true] {
+            let mut profile = fixture();
+            if awg {
+                profile.config=profile.config.replace("[Interface]","[Interface]\nJc=4\nJmin=40\nJmax=70\nS1=10\nS2=20\nH1=123456\nH2=234567\nH3=345678\nH4=456789");
+            }
+            let mut config = super::configuration(&profile).unwrap();
+            config["log"] = serde_json::json!({"disabled":true});
+            let path = root.join("test.json");
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let result = std::process::Command::new(&engine)
+                .arg("check")
+                .arg("-c")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "awg={awg}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the compiled Amnezia Box sidecar"]
+    fn split_sidecar_stops_gracefully_without_installing_routes() {
+        use std::os::windows::process::CommandExt;
+        let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(r"engines\AmneziaBox\nett-split-core.exe");
+        let root = std::env::temp_dir().join(format!("nett-box-lifecycle-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("test.conf");
+        let config = root.join("test.json");
+        std::fs::write(
+            &config,
+            br#"{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}]}"#,
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(engine)
+            .args(["run", "-c"])
+            .arg(config)
+            .arg("--nett-ready-file")
+            .arg(path.with_extension("ready.json"))
+            .arg("--nett-stop-file")
+            .arg(path.with_extension("stop"))
+            .creation_flags(0x08000000)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !super::running(&path) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !super::running(&path) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("sidecar did not become ready");
+        }
+        if let Err(e) = super::stop(&path) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{e}");
+        }
+        assert!(child.wait().unwrap().success());
+        assert!(!super::running(&path));
+        assert!(!path.with_extension("ready.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn addresses_ports_and_invalid_rules() {
+        assert_eq!(
+            super::site("192.168.10.0/24").unwrap()["ip_cidr"][0],
+            "192.168.10.0/24"
+        );
+        assert_eq!(super::site("host.ts.net:8766").unwrap()["port"][0], 8766);
+        assert_eq!(
+            super::site("*.example.com").unwrap()["domain_suffix"][0],
+            "example.com"
+        );
+        for bad in [
+            "192.168.0.1/33",
+            "foo:0",
+            "https://example.com",
+            "../x",
+            "x:99999",
+        ] {
+            assert!(super::site(bad).is_err(), "{bad}");
+        }
+    }
+    #[test]
+    fn direct_exclusions_precede_vpn_inclusions() {
+        let profile=crate::profiles::Profile {id:"test".into(),name:"test".into(),config:"[Interface]\nPrivateKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nEndpoint=1.2.3.4:51820\nAllowedIPs=0.0.0.0/0".into(),sites:crate::profiles::Rules{enabled:true,mode:crate::profiles::Mode::ViaVpn,entries:vec!["example.com".into()]},apps:crate::profiles::Rules{enabled:true,mode:crate::profiles::Mode::Direct,entries:vec![r"C:\Apps\Discord.exe".into()]}};
+        let result = super::configuration(&profile).unwrap();
+        assert_eq!(result["route"]["final"], "direct");
+        assert_eq!(result["route"]["rules"][2]["outbound"], "direct");
+        assert_eq!(result["route"]["rules"][3]["outbound"], "vpn");
+        assert!(result["route"]["rules"][2]["process_path_regex"].is_array());
+        assert_eq!(
+            super::process_pattern(r"C:\Apps\Discord.exe"),
+            r"(?i)^C:\\Apps\\Discord\.exe$"
+        );
+    }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "nett-vpn"
+version = "0.2.0"
+edition = "2024"
+
+[features]
+ui-preview = ["eframe/__screenshot"]
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+raw-window-handle = "0.6.2"
+rfd = "0.15"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tray-icon = "0.21"
+windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_Threading"] }
