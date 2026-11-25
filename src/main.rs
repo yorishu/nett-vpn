@@ -633,7 +633,7 @@ impl NettVpn {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        RichText::new("WINDOWS - BUILD 0.2.4")
+                                        RichText::new("WINDOWS - BUILD 0.2.5")
                                             .font(FontId::monospace(11.0))
                                             .color(DIM),
                                     );

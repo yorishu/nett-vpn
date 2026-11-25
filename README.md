@@ -10,7 +10,7 @@
           [ tunnel terminal / windows x64 ]
 ```
 
-![build](https://img.shields.io/badge/build-0.2.4-9cff44?style=flat-square&labelColor=141d18)
+![build](https://img.shields.io/badge/build-0.2.5-9cff44?style=flat-square&labelColor=141d18)
 ![Rust](https://img.shields.io/badge/client-Rust-9cff44?style=flat-square&labelColor=141d18&logo=rust)
 ![Windows](https://img.shields.io/badge/platform-Windows_x64-9cff44?style=flat-square&labelColor=141d18)
 ![WG + AWG](https://img.shields.io/badge/tunnels-WireGuard_%2B_AmneziaWG-9cff44?style=flat-square&labelColor=141d18)
@@ -34,7 +34,7 @@ No browser shell. No Go installation needed to run it. VPN engines live beside t
 ## 01 // b00t
 
 ```text
-> download  nett-v0.2.4-windows-x64.zip
+> download  nett-v0.2.5-windows-x64.zip
 > extract   the whole archive
 > launch    nett.exe
 > import    your .conf
@@ -117,7 +117,7 @@ CRT overlays do not capture clicks or keyboard focus. Windows reduced-motion pre
 
 ## 05 // d3v
 
-Requirements: a current Rust toolchain with edition 2024 support and a Windows linker. Clone, then:
+Requirements: a current Rust Windows GNU toolchain with edition 2024 support, GCC and `windres` on PATH (included in WinLibs). `build.rs` embeds `nett.ico` and Windows file properties in the EXE. Clone, then:
 
 ```powershell
 cargo build --release --locked
