@@ -94,6 +94,41 @@ pub fn resolve_peers(options: &mut Value) -> Result<Vec<SocketAddr>, String> {
     Ok(peers)
 }
 
+pub(crate) fn direct_dns_server() -> String {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{FIXED_INFO_W2KSP1, GetNetworkParams};
+    unsafe {
+        let mut bytes = 0;
+        GetNetworkParams(std::ptr::null_mut(), &mut bytes);
+        if bytes > 0 && bytes <= 1024 * 1024 {
+            // usize storage supplies the alignment required by the Windows structures.
+            let mut buffer = vec![0usize; (bytes as usize).div_ceil(std::mem::size_of::<usize>())];
+            let info = buffer.as_mut_ptr() as *mut FIXED_INFO_W2KSP1;
+            if GetNetworkParams(info, &mut bytes) == 0 {
+                let mut server: *const windows_sys::Win32::NetworkManagement::IpHelper::IP_ADDR_STRING = &(*info).DnsServerList;
+                while !server.is_null() {
+                    let address: Vec<u8> = (*server)
+                        .IpAddress
+                        .String
+                        .iter()
+                        .take_while(|c| **c != 0)
+                        .map(|c| *c as u8)
+                        .collect();
+                    if let Ok(address) = std::str::from_utf8(&address)
+                        && let Ok(ip) = address.parse::<std::net::Ipv4Addr>()
+                        && !ip.is_unspecified()
+                        && !ip.is_loopback()
+                        && !ip.is_multicast()
+                    {
+                        return ip.to_string();
+                    }
+                    server = (*server).Next;
+                }
+            }
+        }
+    }
+    "1.1.1.1".into()
+}
+
 pub fn connect(profile: &Profile, user: &crate::profiles::UserConfig) -> Result<(), String> {
     let path = profile.stage()?;
     let split = user.split();
@@ -242,7 +277,7 @@ pub fn dispatch() -> Option<i32> {
 }
 
 fn release_guard() -> Result<(), String> {
-    crate::firewall::replace(None, None)?;
+    crate::firewall::replace(None, None, None)?;
     match fs::remove_file(guard_path()?) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -271,8 +306,13 @@ fn controller(action: &str, path: &Path) -> Result<(), String> {
     if action != "connect" {
         return Err("UNKNOWN NETWORK ACTION".into());
     }
+    let split_engine = if plan.split {
+        Some(crate::split::engine()?)
+    } else {
+        None
+    };
     if plan.kill_switch {
-        crate::firewall::replace(Some(&plan.peers), None)?;
+        crate::firewall::replace(Some(&plan.peers), None, split_engine.as_deref())?;
         write_json(&guard_path()?, &true)?;
     } else {
         release_guard()?;
@@ -288,7 +328,7 @@ fn controller(action: &str, path: &Path) -> Result<(), String> {
             && let Some((luid, _)) = crate::health::interface(&plan.alias())
         {
             if plan.kill_switch {
-                crate::firewall::replace(Some(&plan.peers), Some(luid))?;
+                crate::firewall::replace(Some(&plan.peers), Some(luid), split_engine.as_deref())?;
             }
             return Ok(());
         }

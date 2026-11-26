@@ -10,7 +10,7 @@
           [ tunnel terminal / windows x64 ]
 ```
 
-![build](https://img.shields.io/badge/build-0.2.7-9cff44?style=flat-square&labelColor=141d18)
+![build](https://img.shields.io/badge/build-0.2.8-9cff44?style=flat-square&labelColor=141d18)
 ![Rust](https://img.shields.io/badge/client-Rust-9cff44?style=flat-square&labelColor=141d18&logo=rust)
 ![Windows](https://img.shields.io/badge/platform-Windows_x64-9cff44?style=flat-square&labelColor=141d18)
 ![WG + AWG](https://img.shields.io/badge/tunnels-WireGuard_%2B_AmneziaWG-9cff44?style=flat-square&labelColor=141d18)
@@ -34,7 +34,7 @@ No browser shell. No Go installation needed to run it. VPN engines live beside t
 ## 01 // b00t
 
 ```text
-> download  nett-v0.2.7-windows-x64.zip
+> download  nett-v0.2.8-windows-x64.zip
 > extract   the whole archive
 > launch    nett.exe
 > import    your .conf
@@ -66,7 +66,7 @@ Before upgrading, exit the previous copy through `qu1t`. Do not run two Nett ins
 | `SAVE & APPLY` | Save the current section; VPN profiles and user config save independently |
 | `BACK` | Return; confirm before discarding unsaved changes |
 | `F8` | Toggle CRT effects immediately |
-| `kill switch [X]` | Arm strict protection for the next connection; disconnect before changing |
+| `kill switch [X]` | Protect VPN traffic while respecting DIRECTLY; disconnect before changing |
 | `HIDE` / `CLOSE` | Hide the window; keep the tunnel running |
 | Tray → `s33` | Restore the window |
 | Tray → `qu1t` | Stop the tunnel, then exit |
@@ -77,7 +77,11 @@ The tray **k** turns green and the title reports `wired` only after a TCP connec
 
 Split tunnels use an authenticated, loopback-only probe listener pinned to the VPN outbound before user routing rules. Native tunnels bind the probe to their Windows interface. Neither probe falls back to direct internet.
 
-The red kill switch is off by default. Enable it before CONNECT. Its persistent Windows Filtering Platform filters arm before engine startup and block ordinary IPv4/IPv6 traffic in both directions outside the selected VPN, including DIRECTLY exceptions. VPN peer UDP endpoints, localhost, DHCP and link-local IPv6 discovery remain available; ordinary direct DNS is blocked, and split DNS uses VPN. If the engine or client crashes, filtering remains in place. Manual DISCONNECT and tray `qu1t` stop the tunnel and release filtering. HIDE/CLOSE keep it active.
+The red kill switch is off by default. Enable it before CONNECT. Persistent Windows Filtering Platform filters arm before engine startup. With split tunneling, only the bundled split core may open physical connections for DIRECTLY rules and any other traffic your routing policy assigns to direct. Ordinary applications cannot bypass the firewall themselves; the core's VPN outbound has no direct fallback. No shared website IPs are globally whitelisted. Without split tunneling, protection stays strict. VPN transport endpoints, localhost, DHCP and link-local IPv6 discovery remain available.
+
+DIRECTLY domain DNS rules remain direct; VPN domain DNS rules remain VPN. When protection is enabled, direct DNS is sent by the allowed core to the first usable non-loopback IPv4 resolver from Windows (fallback: `1.1.1.1`). This avoids relying on the blocked shared Windows DNS process. Application-owned encrypted DNS follows application routing; shared system DNS still cannot be isolated per application, so an app using the default VPN resolver can lose uncached name resolution during a VPN outage.
+
+If the VPN peer stops responding while the split core remains alive, DIRECTLY routes can continue; VPN routes fail closed. If the core itself crashes, filtering persists and blocks traffic until recovery or an explicit disconnect. Manual DISCONNECT and tray `qu1t` stop the tunnel and release filtering. HIDE/CLOSE keep the connection and protection active.
 
 After a crash, reopen Nett and use DISCONNECT or turn off the red switch to release protection. If the UI cannot open, run PowerShell from the application directory: `Start-Process .\nett.exe -ArgumentList '--nett-network clear _global' -Verb RunAs -Wait -WindowStyle Hidden`. This explicitly removes Nett's filters; it does not remove other firewall rules.
 

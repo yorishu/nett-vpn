@@ -114,7 +114,7 @@ fn native_connect(index: u32, target: SocketAddr) -> Result<(), String> {
     }
 }
 
-fn socks_connect(port: u16, password: &str, target: SocketAddr) -> Result<(), String> {
+pub(crate) fn socks_connect(port: u16, password: &str, target: SocketAddr) -> Result<(), String> {
     let mut stream =
         TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), TIMEOUT)
             .map_err(|_| "VPN PROBE LISTENER UNAVAILABLE")?;

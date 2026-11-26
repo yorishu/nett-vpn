@@ -715,7 +715,7 @@ impl NettVpn {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        RichText::new("WINDOWS - BUILD 0.2.7")
+                                        RichText::new("WINDOWS - BUILD 0.2.8")
                                             .font(FontId::monospace(11.0))
                                             .color(DIM),
                                     );
@@ -885,7 +885,7 @@ impl NettVpn {
                                         .stroke(Stroke::new(1.0_f32, Color32::LIGHT_RED))
                                         .min_size(Vec2::new(132.0, 24.0));
                                     if ui.add_enabled(!self.connected && self.pending.is_none(), button)
-                                        .on_hover_text("Strict: blocks all traffic outside this VPN, including DIRECTLY. Arms on CONNECT; releases on DISCONNECT or qu1t. Disconnect before changing.")
+                                        .on_hover_text("Protects VPN traffic without blocking DIRECTLY through the split core. If the core crashes, traffic stays blocked until recovery or DISCONNECT. Arms on CONNECT; releases on DISCONNECT or qu1t.")
                                         .clicked() { self.toggle_kill_switch(ctx); }
                                 });
                                 });

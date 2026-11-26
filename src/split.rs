@@ -446,7 +446,8 @@ pub fn prepare(
     let mut options = configuration(profile, user)?;
     resolve_awg_endpoints(&mut options)?;
     let peers = crate::network::resolve_peers(&mut options)?;
-    add_probe(&mut options, user.kill_switch, port, password);
+    let direct_dns = user.kill_switch.then(crate::network::direct_dns_server);
+    add_probe(&mut options, direct_dns.as_deref(), port, password);
     let config = path.with_extension("split.json");
     std::fs::write(
         &config,
@@ -468,15 +469,19 @@ pub fn prepare(
     Ok(peers)
 }
 
-fn add_probe(options: &mut Value, strict: bool, port: u16, password: &str) {
+pub(crate) fn add_probe(options: &mut Value, direct_dns: Option<&str>, port: u16, password: &str) {
     options["inbounds"].as_array_mut().unwrap().push(json!({"type":"socks","tag":"nett-health","listen":"127.0.0.1","listen_port":port,"users":[{"username":"nett","password":password}]}));
     options["route"]["rules"].as_array_mut().unwrap().insert(
         0,
         json!({"inbound":["nett-health"],"action":"route","outbound":"vpn"}),
     );
-    if strict {
-        options["dns"]["rules"] = json!([]);
-        options["dns"]["final"] = json!("dns-vpn");
+    if let Some(server) = direct_dns {
+        // Windows' shared DNS service is a different process; send DIRECTLY DNS from the allowed core.
+        for resolver in options["dns"]["servers"].as_array_mut().unwrap() {
+            if resolver["tag"] == "dns-direct" {
+                *resolver = json!({"type":"udp","tag":"dns-direct","server":server});
+            }
+        }
     }
 }
 
@@ -587,7 +592,12 @@ mod tests {
                 "\nPersistentKeepalive=25"
             });
             let mut config = super::configuration(&profile, &user()).unwrap();
-            super::add_probe(&mut config, awg, 51889, "test-password");
+            super::add_probe(
+                &mut config,
+                awg.then_some("192.0.2.53"),
+                51889,
+                "test-password",
+            );
             config["log"] = serde_json::json!({"disabled":true});
             let path = root.join("test.json");
             std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -670,7 +680,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let mut route_free = serde_json::json!({"log":{"disabled":true},"inbounds":[],"dns":{},"endpoints":endpoints,"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[],"final":"direct"}});
-        super::add_probe(&mut route_free, false, port, "test-password");
+        super::add_probe(&mut route_free, None, port, "test-password");
         std::fs::write(&config, serde_json::to_vec(&route_free).unwrap()).unwrap();
         let mut child = std::process::Command::new(engine)
             .args(["run", "-c"])
@@ -724,14 +734,16 @@ mod tests {
         );
     }
     #[test]
-    fn verification_route_precedes_direct_rules_and_strict_dns_uses_vpn() {
+    fn verification_stays_on_vpn_while_direct_dns_rules_are_preserved() {
         let mut config = super::configuration(&fixture(), &user()).unwrap();
-        super::add_probe(&mut config, true, 51889, "test-password");
+        super::add_probe(&mut config, Some("192.0.2.53"), 51889, "test-password");
         let first = &config["route"]["rules"][0];
         assert_eq!(first["inbound"][0], "nett-health");
         assert_eq!(first["outbound"], "vpn");
-        assert_eq!(config["dns"]["final"], "dns-vpn");
-        assert_eq!(config["dns"]["rules"], serde_json::json!([]));
+        assert_eq!(config["dns"]["final"], "dns-direct");
+        assert_eq!(config["dns"]["rules"][0]["server"], "dns-vpn");
+        assert_eq!(config["dns"]["servers"][0]["type"], "udp");
+        assert_eq!(config["dns"]["servers"][0]["server"], "192.0.2.53");
         assert_eq!(config["inbounds"][1]["listen"], "127.0.0.1");
         assert_eq!(
             config["inbounds"][1]["users"][0]["password"],
