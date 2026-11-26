@@ -10,7 +10,7 @@
           [ tunnel terminal / windows x64 ]
 ```
 
-![build](https://img.shields.io/badge/build-0.2.6-9cff44?style=flat-square&labelColor=141d18)
+![build](https://img.shields.io/badge/build-0.2.7-9cff44?style=flat-square&labelColor=141d18)
 ![Rust](https://img.shields.io/badge/client-Rust-9cff44?style=flat-square&labelColor=141d18&logo=rust)
 ![Windows](https://img.shields.io/badge/platform-Windows_x64-9cff44?style=flat-square&labelColor=141d18)
 ![WG + AWG](https://img.shields.io/badge/tunnels-WireGuard_%2B_AmneziaWG-9cff44?style=flat-square&labelColor=141d18)
@@ -34,7 +34,7 @@ No browser shell. No Go installation needed to run it. VPN engines live beside t
 ## 01 // b00t
 
 ```text
-> download  nett-v0.2.6-windows-x64.zip
+> download  nett-v0.2.7-windows-x64.zip
 > extract   the whole archive
 > launch    nett.exe
 > import    your .conf
@@ -61,9 +61,9 @@ Before upgrading, exit the previous copy through `qu1t`. Do not run two Nett ins
 | :--- | :--- |
 | `SETTINGS` | Open the control deck above `IMPORT .CONF` |
 | `PROFILES` | Import, select, rename or delete saved profiles |
-| `SITES` / `APPS` | Configure split routing for the selected profile |
+| `SITES` / `APPS` | Configure global user routing rules shared by all VPN profiles |
 | `DISPLAY` | Change CRT effects and animation, even with VPN active |
-| `SAVE & APPLY` | Save settings; `DISPLAY` saves display preferences only |
+| `SAVE & APPLY` | Save the current section; VPN profiles and user config save independently |
 | `BACK` | Return; confirm before discarding unsaved changes |
 | `F8` | Toggle CRT effects immediately |
 | `kill switch [X]` | Arm strict protection for the next connection; disconnect before changing |
@@ -71,7 +71,7 @@ Before upgrading, exit the previous copy through `qu1t`. Do not run two Nett ins
 | Tray → `s33` | Restore the window |
 | Tray → `qu1t` | Stop the tunnel, then exit |
 
-Profile and routing edits are locked while connected. Display preferences are saved independently and do not restart the VPN. Importing a profile also saves the current draft. Split lists are saved independently of engine validation; a connection error never clears saved rules. Successful saves retain the current settings tab. AWG boolean fields support on/off, yes/no, true/false and 1/0; empty optional fields are treated as unset. AWG PersistentKeepalive ranges such as 25-35 are preserved by the bundled split core; off disables keepalive.
+Profile and routing edits are locked while connected. Display preferences are saved independently and do not restart the VPN. Importing a VPN profile saves VPN-profile edits while preserving any pending user-config draft. Saving one config does not commit or discard unsaved edits in the other. Split lists are saved independently of engine validation; a connection error never clears saved rules. Successful saves retain the current settings tab. AWG boolean fields support on/off, yes/no, true/false and 1/0; empty optional fields are treated as unset. AWG PersistentKeepalive ranges such as 25-35 are preserved by the bundled split core; off disables keepalive.
 
 The tray **k** turns green and the title reports `wired` only after a TCP connection succeeds through the VPN. A running engine with a failed probe remains unverified; DISCONNECT stays available. Probes repeat in the background approximately every three seconds, with bounded timeouts. The probe tries `1.1.1.1:443` and `1.0.0.1:443`; profiles that cannot reach either destination remain unverified even if a private-network tunnel works. A failed disconnect or cancelled UAC leaves Nett open with an error instead of silently exiting.
 
@@ -83,7 +83,7 @@ After a crash, reopen Nett and use DISCONNECT or turn off the red switch to rele
 
 ## 03 // r0ut3
 
-Each profile has separate site and application lists.
+User config has one site list and one application list shared by every VPN profile. You can edit and save these lists before importing a VPN config. Importing, switching, renaming or deleting a VPN profile never replaces them.
 
 | Mode | Listed destinations | Everything else |
 | :--- | :--- | :--- |
@@ -114,9 +114,14 @@ Routing limits:
 
 ```text
 %LOCALAPPDATA%\nett-vpn\profiles.dpapi
+%LOCALAPPDATA%\nett-vpn\user-config.dpapi
 ```
 
-The library is encrypted with Windows DPAPI for the current account. Original import files are no longer needed. The old single-profile format is migrated automatically; startup does not automatically connect.
+Both stores are encrypted with Windows DPAPI for the current account. `profiles.dpapi` contains only VPN profiles and the selected profile. `user-config.dpapi` contains global site/app rules, display preferences and kill-switch preference. Saving either store does not rewrite the other. Original import files are no longer needed; startup does not automatically connect.
+
+On upgrade, the selected VPN profile's old routing rules become the global user rules (the first profile is used if none was selected). Existing user config always wins and is never replaced by migration. The complete original encrypted vault, including other profiles' old rule sets, is preserved as `profiles.before-user-config.dpapi`. The older single-profile format is also migrated automatically.
+
+Exit the old client through `qu1t` before upgrading. Older clients do not read the new user-config store; avoid running them against the migrated data directory.
 
 Engines also need working `.conf` / `.json` files. These files and logs can contain keys or network metadata; their directory ACL permits the current user, SYSTEM and administrators. Do not publish this directory or copy it into an issue.
 

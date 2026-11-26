@@ -94,9 +94,10 @@ pub fn resolve_peers(options: &mut Value) -> Result<Vec<SocketAddr>, String> {
     Ok(peers)
 }
 
-pub fn connect(profile: &Profile, kill_switch: bool) -> Result<(), String> {
+pub fn connect(profile: &Profile, user: &crate::profiles::UserConfig) -> Result<(), String> {
     let path = profile.stage()?;
-    let split = profile.split();
+    let split = user.split();
+    let kill_switch = user.kill_switch;
     let mut password = [0u8; 16];
     unsafe {
         use windows_sys::Win32::Security::Cryptography::{
@@ -125,7 +126,7 @@ pub fn connect(profile: &Profile, kill_switch: bool) -> Result<(), String> {
         None
     };
     let peers = if let Some(port) = probe_port {
-        crate::split::prepare(profile, kill_switch, port, &probe_password)?
+        crate::split::prepare(profile, user, port, &probe_password)?
     } else {
         let mut peers = Vec::new();
         let mut text = String::new();

@@ -2,34 +2,37 @@
 pub fn app() -> super::NettVpn {
     use super::profiles::{Library, Mode, Profile, Rules};
     let screen = std::env::var("NETT_PREVIEW_SCREEN").unwrap_or_else(|_| "home".into());
-    let profile = Profile {
-        id: "preview".into(),
-        name: "home / amneziawg".into(),
-        config: "[Interface]\nJc=4".into(),
-        sites: Rules {
-            enabled: true,
-            mode: Mode::Direct,
-            entries: vec![
-                "192.168.10.0/24".into(),
-                "example.com".into(),
-                "host.ts.net:8766".into(),
-            ],
-        },
-        apps: Rules {
-            enabled: true,
-            mode: Mode::Direct,
-            entries: vec![
-                r"C:\Apps\Discord.exe".into(),
-                r"C:\Apps\qbittorrent.exe".into(),
-            ],
-        },
-    };
     let library = Library {
-        profiles: vec![profile],
-        selected: Some("preview".into()),
-        effects: std::env::var_os("NETT_PREVIEW_CLEAN").is_none(),
-        motion: screen == "glitch",
-        kill_switch: ["blocked", "wired"].contains(&screen.as_str()),
+        vpn: crate::profiles::VpnConfig {
+            profiles: vec![Profile {
+                id: "preview".into(),
+                name: "home / amneziawg".into(),
+                config: "[Interface]\nJc=4".into(),
+            }],
+            selected: Some("preview".into()),
+        },
+        user: crate::profiles::UserConfig {
+            sites: Rules {
+                enabled: true,
+                mode: Mode::Direct,
+                entries: vec![
+                    "192.168.10.0/24".into(),
+                    "example.com".into(),
+                    "host.ts.net:8766".into(),
+                ],
+            },
+            apps: Rules {
+                enabled: true,
+                mode: Mode::Direct,
+                entries: vec![
+                    r"C:\Apps\Discord.exe".into(),
+                    r"C:\Apps\qbittorrent.exe".into(),
+                ],
+            },
+            effects: std::env::var_os("NETT_PREVIEW_CLEAN").is_none(),
+            motion: screen == "glitch",
+            kill_switch: ["blocked", "wired"].contains(&screen.as_str()),
+        },
     };
     let mut app = super::NettVpn::default();
     app.protocol = Some(super::Protocol::AmneziaWg);

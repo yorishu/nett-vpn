@@ -1,6 +1,6 @@
 use crate::{
     DIM, LIME, PANEL, RichText, Vec2, egui,
-    profiles::{Library, Mode, Rules},
+    profiles::{Library, Mode, Rules, UserConfig, VpnConfig},
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -13,6 +13,7 @@ enum Page {
 
 pub enum Action {
     Save(Library),
+    SaveUser(UserConfig),
     SaveDisplay(bool, bool),
     Import,
     PickApp,
@@ -53,34 +54,40 @@ impl Settings {
         }
     }
 
-    pub fn accept_saved(&mut self, library: Library) {
-        self.saved = library.clone();
-        self.draft = library;
+    pub fn accept_vpn(&mut self, vpn: VpnConfig) {
+        self.saved.vpn = vpn.clone();
+        self.draft.vpn = vpn;
         self.error.clear();
         self.delete = None;
         self.confirm_discard = false;
     }
+    pub fn accept_user(&mut self, user: UserConfig) {
+        self.saved.user = user.clone();
+        self.draft.user = user;
+        self.error.clear();
+        self.confirm_discard = false;
+    }
 
     pub fn accept_display(&mut self, effects: bool, motion: bool) {
-        self.saved.effects = effects;
-        self.saved.motion = motion;
-        self.draft.effects = effects;
-        self.draft.motion = motion;
+        self.saved.user.effects = effects;
+        self.saved.user.motion = motion;
+        self.draft.user.effects = effects;
+        self.draft.user.motion = motion;
         if self.draft == self.saved {
             self.confirm_discard = false;
         }
     }
 
     pub fn add_app(&mut self, path: String) {
-        if let Some(profile) = self.draft.selected_mut() {
-            if !profile
-                .apps
-                .entries
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case(&path))
-            {
-                profile.apps.entries.push(path);
-            }
+        if !self
+            .draft
+            .user
+            .apps
+            .entries
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(&path))
+        {
+            self.draft.user.apps.entries.push(path);
         }
     }
 
@@ -136,14 +143,14 @@ impl Settings {
                             ui.label(RichText::new("encrypted profile library").monospace().color(DIM));
                             if ui.button(RichText::new("+ IMPORT .CONF").monospace()).clicked() { action=Some(Action::Import); }
                         });
-                        if self.draft.profiles.is_empty() { ui.label("No profiles. Import a WireGuard or AmneziaWG config."); }
+                        if self.draft.vpn.profiles.is_empty() { ui.label("No profiles. Import a WireGuard or AmneziaWG config."); }
                         let mut remove=None;
-                        for profile in &mut self.draft.profiles {
+                        for profile in &mut self.draft.vpn.profiles {
                             egui::Frame::new().fill(PANEL).inner_margin(10.0).show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    let selected=self.draft.selected.as_ref()==Some(&profile.id);
+                                    let selected=self.draft.vpn.selected.as_ref()==Some(&profile.id);
                                     if ui.selectable_label(selected, RichText::new(if selected {"[SELECTED]"}else{"[  USE   ]"}).monospace()).clicked() {
-                                        self.draft.selected=Some(profile.id.clone());
+                                        self.draft.vpn.selected=Some(profile.id.clone());
                                     }
                                     ui.add(egui::TextEdit::singleline(&mut profile.name).desired_width(220.0).char_limit(64)).on_hover_text("Profile name");
                                     ui.label(RichText::new(if profile.protocol()==crate::Protocol::AmneziaWg {"AWG"}else{"WG"}).monospace().color(DIM));
@@ -160,15 +167,14 @@ impl Settings {
                             ui.add_space(8.0);
                         }
                         if let Some(id)=remove {
-                            self.draft.profiles.retain(|p|p.id!=id);
-                            if self.draft.selected.as_ref()==Some(&id) { self.draft.selected=self.draft.profiles.first().map(|p|p.id.clone()); }
+                            self.draft.vpn.profiles.retain(|p|p.id!=id);
+                            if self.draft.vpn.selected.as_ref()==Some(&id) { self.draft.vpn.selected=self.draft.vpn.profiles.first().map(|p|p.id.clone()); }
                         }
                     }
                     Page::Sites | Page::Apps => {
                         let apps=self.page==Page::Apps;
-                        if let Some(profile)=self.draft.selected_mut() {
-                            ui.label(RichText::new(format!("profile / {}",profile.name)).monospace().color(DIM));
-                            let rules=if apps {&mut profile.apps}else{&mut profile.sites};
+                            ui.label(RichText::new("user config / all vpn profiles").monospace().color(DIM));
+                            let rules=if apps {&mut self.draft.user.apps}else{&mut self.draft.user.sites};
                             ui.checkbox(&mut rules.enabled, if apps {"APP SPLIT TUNNELING"}else{"SITE SPLIT TUNNELING"});
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
@@ -197,13 +203,12 @@ impl Settings {
                             }
                             ui.add_space(8.0);
                             entries(ui,rules);
-                        } else { ui.label("Select or import a profile first."); }
                     }
                     Page::Display => {
                         ui.label(RichText::new("phosphor / display controls").monospace().color(LIME));
                         ui.add_space(12.0);
-                        ui.checkbox(&mut self.draft.effects,"CRT DISPLAY: scanlines / pixel grid / vignette");
-                        ui.checkbox(&mut self.draft.motion,"ANIMATION: raster reveal / soft sweep / rare glitches");
+                        ui.checkbox(&mut self.draft.user.effects,"CRT DISPLAY: scanlines / pixel grid / vignette");
+                        ui.checkbox(&mut self.draft.user.motion,"ANIMATION: raster reveal / soft sweep / rare glitches");
                         ui.add_space(8.0);
                         ui.label(RichText::new("F8 toggles effects immediately. Windows reduced-motion preferences are respected.").monospace().color(DIM));
                     }
@@ -228,7 +233,15 @@ impl Settings {
                 .clicked()
             {
                 if self.page == Page::Display {
-                    action = Some(Action::SaveDisplay(self.draft.effects, self.draft.motion));
+                    action = Some(Action::SaveDisplay(
+                        self.draft.user.effects,
+                        self.draft.user.motion,
+                    ));
+                } else if self.page == Page::Sites || self.page == Page::Apps {
+                    match self.draft.user.validate() {
+                        Ok(()) => action = Some(Action::SaveUser(self.draft.user.clone())),
+                        Err(e) => self.error = e,
+                    }
                 } else {
                     match self.draft.validate() {
                         Ok(()) => action = Some(Action::Save(self.draft.clone())),
@@ -239,8 +252,10 @@ impl Settings {
             ui.label(
                 RichText::new(if self.page == Page::Display {
                     "Display settings apply immediately."
+                } else if self.page == Page::Profiles {
+                    "VPN profiles only. User config is kept."
                 } else {
-                    "Changes apply on next connection."
+                    "All VPN profiles. Applies next connection."
                 })
                 .monospace()
                 .small()
@@ -255,7 +270,7 @@ impl Settings {
                         .color(LIME)
                         .strong(),
                 );
-                ui.label("Use SAVE & APPLY to keep your profile and routing edits.");
+                ui.label("Use SAVE & APPLY in each edited section before leaving.");
                 ui.horizontal(|ui| {
                     if ui.button("KEEP EDITING").clicked() {
                         self.confirm_discard = false;
@@ -292,19 +307,29 @@ fn entries(ui: &mut egui::Ui, rules: &mut Rules) {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn saving_keeps_current_tab_and_clears_dirty_state() {
+    fn global_apps_do_not_require_a_vpn_profile() {
+        let mut settings = super::Settings::new(Default::default());
+        settings.add_app(r"C:\Apps\Discord.exe".into());
+        settings.add_app(r"c:\apps\discord.EXE".into());
+        assert!(settings.draft.vpn.profiles.is_empty());
+        assert_eq!(
+            settings.draft.user.apps.entries,
+            vec![r"C:\Apps\Discord.exe"]
+        );
+    }
+    #[test]
+    fn saving_one_config_preserves_the_other_unsaved_draft() {
         let mut settings = super::Settings::new(Default::default());
         settings.page = super::Page::Apps;
-        settings.draft.motion = false;
-        settings.confirm_discard = true;
-        let saved = settings.draft.clone();
-        settings.accept_saved(saved.clone());
+        settings.draft.user.motion = false;
+        settings.draft.vpn.selected = Some("unsaved".into());
+        settings.accept_user(settings.draft.user.clone());
+        assert_eq!(settings.draft.vpn.selected.as_deref(), Some("unsaved"));
+        assert!(settings.saved.vpn.selected.is_none());
+        settings.draft.user.effects = false;
+        settings.accept_vpn(Default::default());
+        assert!(!settings.draft.user.effects && settings.saved.user.effects);
         assert!(settings.page == super::Page::Apps);
-        assert!(settings.draft == saved && settings.saved == saved);
-        assert!(!settings.confirm_discard);
-        settings.draft.effects = false;
-        settings.accept_display(false, false);
-        assert!(settings.draft == settings.saved);
     }
     #[test]
     fn animation_can_be_edited_and_saved_while_vpn_is_active() {
@@ -368,7 +393,7 @@ mod tests {
                 ],
             );
         }
-        assert!(!settings.draft.motion);
+        assert!(!settings.draft.user.motion);
         let (output, _) = frame(&mut settings, &ctx, vec![]);
         let save = center(&output, "SAVE & APPLY");
         let mut result = None;

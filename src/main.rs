@@ -39,6 +39,7 @@ enum Completion {
     Toggled(bool),
     DisplaySaved(bool, bool),
     KillSwitch(bool),
+    UserSaved(profiles::UserConfig),
     Library(
         profiles::Library,
         Option<(PathBuf, Protocol, bool)>,
@@ -120,8 +121,15 @@ impl NettVpn {
         };
         self.pending = None;
         match result {
+            Ok(Completion::UserSaved(user)) => {
+                self.library.user = user.clone();
+                if let Some(settings) = &mut self.settings {
+                    settings.accept_user(user);
+                }
+                self.message = "USER CONFIG SAVED - APPLIES TO ALL VPN PROFILES".into();
+            }
             Ok(Completion::KillSwitch(enabled)) => {
-                self.library.kill_switch = enabled;
+                self.library.user.kill_switch = enabled;
                 self.guarded = false;
                 self.message = if enabled {
                     "KILL SWITCH ARMED FOR NEXT CONNECTION"
@@ -131,8 +139,8 @@ impl NettVpn {
                 .into();
             }
             Ok(Completion::DisplaySaved(effects, motion)) => {
-                self.library.effects = effects;
-                self.library.motion = motion;
+                self.library.user.effects = effects;
+                self.library.user.motion = motion;
                 if let Some(settings) = &mut self.settings {
                     settings.accept_display(effects, motion);
                 }
@@ -150,7 +158,7 @@ impl NettVpn {
                 self.connected = active.is_some_and(|a| a.2);
                 self.verified = false;
                 if let Some(settings) = &mut self.settings {
-                    settings.accept_saved(library.clone());
+                    settings.accept_vpn(library.vpn.clone());
                 }
                 self.library = library;
             }
@@ -188,11 +196,10 @@ impl NettVpn {
         if self.connected || self.guarded {
             return;
         }
-        let mut library = self
-            .settings
-            .as_ref()
-            .map(|s| s.draft.clone())
-            .unwrap_or_else(|| self.library.clone());
+        let mut library = self.library.clone();
+        if let Some(settings) = &self.settings {
+            library.vpn = settings.draft.vpn.clone();
+        }
         self.start(ctx, "IMPORTING CONFIG...", move || {
             ensure_editable(&library)?;
             let Some(path) = rfd::FileDialog::new()
@@ -202,7 +209,7 @@ impl NettVpn {
                 return Ok(Completion::Cancelled);
             };
             library.import(&path)?;
-            library.save()?;
+            library.save_vpn()?;
             library_completion(library)
         });
     }
@@ -213,7 +220,7 @@ impl NettVpn {
         };
         let connected = self.connected || self.guarded;
         let profile = self.library.selected().cloned();
-        let kill_switch = self.library.kill_switch;
+        let user = self.library.user.clone();
         self.start(
             ctx,
             if connected {
@@ -226,7 +233,7 @@ impl NettVpn {
                     network::stop(&path, protocol)?;
                     return Ok(Completion::Toggled(false));
                 }
-                network::connect(&profile.ok_or("PROFILE NOT FOUND")?, kill_switch)?;
+                network::connect(&profile.ok_or("PROFILE NOT FOUND")?, &user)?;
                 Ok(Completion::Toggled(true))
             },
         );
@@ -237,20 +244,20 @@ impl NettVpn {
             return;
         }
         let mut library = self.library.clone();
-        library.kill_switch = !self.guarded && !library.kill_switch;
+        library.user.kill_switch = !self.guarded && !library.user.kill_switch;
         self.start(ctx, "UPDATING KILL SWITCH...", move || {
-            if !library.kill_switch {
+            if !library.user.kill_switch {
                 network::clear()?;
             }
-            library.save()?;
-            Ok(Completion::KillSwitch(library.kill_switch))
+            library.user.save()?;
+            Ok(Completion::KillSwitch(library.user.kill_switch))
         });
     }
 }
 
 fn library_completion(mut library: profiles::Library) -> Result<Completion, String> {
     let mut active = None;
-    for profile in &library.profiles {
+    for profile in &library.vpn.profiles {
         let path = profile.path()?;
         if connection_running(profile.protocol(), &path) {
             if active.is_some() {
@@ -260,7 +267,7 @@ fn library_completion(mut library: profiles::Library) -> Result<Completion, Stri
         }
     }
     if let Some(active) = active {
-        library.selected = Some(active);
+        library.vpn.selected = Some(active);
     }
     let selection = if let Some(profile) = library.selected() {
         let path = profile.path()?;
@@ -282,7 +289,7 @@ fn ensure_editable(library: &profiles::Library) -> Result<(), String> {
     if network::guarded() {
         return Err("DISCONNECT TO RELEASE KILL SWITCH BEFORE EDITING".into());
     }
-    for profile in &library.profiles {
+    for profile in &library.vpn.profiles {
         if connection_running(profile.protocol(), &profile.path()?) {
             return Err("DISCONNECT BEFORE EDITING PROFILES OR RULES".into());
         }
@@ -542,8 +549,8 @@ impl NettVpn {
             let display = self
                 .settings
                 .as_mut()
-                .map(|s| &mut s.draft)
-                .unwrap_or(&mut self.library);
+                .map(|s| &mut s.draft.user)
+                .unwrap_or(&mut self.library.user);
             display.effects = !display.effects;
         }
         egui::CentralPanel::default()
@@ -618,12 +625,20 @@ impl NettVpn {
                         self.pending.is_some(),
                     );
                     match action {
+                        Some(settings::Action::SaveUser(user)) => {
+                            let previous = self.library.clone();
+                            self.start(ctx, "SAVING USER CONFIG...", move || {
+                                ensure_editable(&previous)?;
+                                user.save()?;
+                                Ok(Completion::UserSaved(user))
+                            });
+                        }
                         Some(settings::Action::SaveDisplay(effects, motion)) => {
                             let mut library = self.library.clone();
-                            library.effects = effects;
-                            library.motion = motion;
+                            library.user.effects = effects;
+                            library.user.motion = motion;
                             self.start(ctx, "SAVING DISPLAY...", move || {
-                                library.save()?;
+                                library.user.save()?;
                                 Ok(Completion::DisplaySaved(effects, motion))
                             });
                         }
@@ -641,14 +656,15 @@ impl NettVpn {
                                 ))
                             })
                         }
-                        Some(settings::Action::Save(library)) => {
+                        Some(settings::Action::Save(mut library)) => {
                             let previous = self.library.clone();
+                            library.user = previous.user.clone();
                             self.start(ctx, "SAVING SETTINGS...", move || {
                                 ensure_editable(&previous)?;
-                                library.save()?;
+                                library.save_vpn()?;
                                 let mut warning = None;
-                                for removed in previous.profiles.iter().filter(|old| {
-                                    !library.profiles.iter().any(|new| new.id == old.id)
+                                for removed in previous.vpn.profiles.iter().filter(|old| {
+                                    !library.vpn.profiles.iter().any(|new| new.id == old.id)
                                 }) {
                                     for ext in
                                         ["conf", "split.json", "split.log", "ready.json", "stop"]
@@ -699,7 +715,7 @@ impl NettVpn {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        RichText::new("WINDOWS - BUILD 0.2.6")
+                                        RichText::new("WINDOWS - BUILD 0.2.7")
                                             .font(FontId::monospace(11.0))
                                             .color(DIM),
                                     );
@@ -852,7 +868,7 @@ impl NettVpn {
                                 ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(
-                                        if self.library.selected().is_some_and(|p| p.split()) {
+                                        if self.library.user.split() {
                                             "ENGINE: NETT SPLIT CORE - UAC REQUIRED"
                                         } else {
                                             "ENGINE: WINDOWS TUNNEL SERVICE - UAC REQUIRED"
@@ -863,7 +879,7 @@ impl NettVpn {
                                     .color(DIM),
                                 );
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let label = if self.library.kill_switch { "kill switch [X]" } else { "kill switch [ ]" };
+                                    let label = if self.library.user.kill_switch { "kill switch [X]" } else { "kill switch [ ]" };
                                     let button = egui::Button::new(RichText::new(label).monospace().color(Color32::LIGHT_RED))
                                         .fill(Color32::from_rgb(43, 23, 24))
                                         .stroke(Stroke::new(1.0_f32, Color32::LIGHT_RED))
@@ -899,8 +915,8 @@ impl NettVpn {
         let display = self
             .settings
             .as_ref()
-            .map(|s| &s.draft)
-            .unwrap_or(&self.library);
+            .map(|s| &s.draft.user)
+            .unwrap_or(&self.library.user);
         if display.effects {
             crt::paint(
                 ctx,
@@ -1025,30 +1041,29 @@ mod tests {
     #[test]
     fn failed_operation_preserves_rules_and_unsaved_draft() {
         let mut app = super::NettVpn::default();
-        app.library.profiles.push(super::profiles::Profile {
+        app.library.vpn.profiles.push(super::profiles::Profile {
             id: "test".into(),
             name: "home".into(),
             config: "[Interface]\nJc=4\nDisableCookies=".into(),
-            sites: super::profiles::Rules {
-                enabled: true,
-                mode: super::profiles::Mode::Direct,
-                entries: vec!["example.com".into()],
-            },
-            apps: super::profiles::Rules {
-                enabled: true,
-                mode: super::profiles::Mode::Direct,
-                entries: vec![r"C:\Apps\ShairportQt.exe".into()],
-            },
         });
-        app.library.selected = Some("test".into());
+        app.library.user.sites = super::profiles::Rules {
+            enabled: true,
+            mode: super::profiles::Mode::Direct,
+            entries: vec!["example.com".into()],
+        };
+        app.library.user.apps = super::profiles::Rules {
+            enabled: true,
+            mode: super::profiles::Mode::Direct,
+            entries: vec![r"C:\Apps\ShairportQt.exe".into()],
+        };
+        app.library.vpn.selected = Some("test".into());
         let saved = app.library.clone();
         app.settings = Some(super::settings::Settings::new(saved.clone()));
         app.settings
             .as_mut()
             .unwrap()
             .draft
-            .selected_mut()
-            .unwrap()
+            .user
             .sites
             .entries
             .push("192.168.10.0/24".into());
@@ -1181,7 +1196,7 @@ mod tests {
                 modifiers: Default::default(),
             }],
         );
-        assert!(!app.settings.as_ref().unwrap().draft.effects);
+        assert!(!app.settings.as_ref().unwrap().draft.user.effects);
         let output = ui_frame(&mut app, &ctx, vec![]);
         click(&mut app, &ctx, text_rect(&output, "< BACK").center());
         assert!(app.settings.is_some());
@@ -1196,17 +1211,9 @@ mod tests {
     }
 
     #[test]
-    fn split_controls_change_draft_but_are_locked_during_connection() {
+    fn global_split_controls_work_without_vpn_and_lock_when_connected() {
         let ctx = super::egui::Context::default();
         let mut app = super::NettVpn::default();
-        app.library.profiles.push(super::profiles::Profile {
-            id: "fixture".into(),
-            name: "home".into(),
-            config: String::new(),
-            sites: Default::default(),
-            apps: Default::default(),
-        });
-        app.library.selected = Some("fixture".into());
         app.settings = Some(super::settings::Settings::new(app.library.clone()));
         app.connected = true;
         let output = ui_frame(&mut app, &ctx, vec![]);
@@ -1217,16 +1224,7 @@ mod tests {
             &ctx,
             text_rect(&output, "SITE SPLIT TUNNELING").center(),
         );
-        assert!(
-            !app.settings
-                .as_ref()
-                .unwrap()
-                .draft
-                .selected()
-                .unwrap()
-                .sites
-                .enabled
-        );
+        assert!(!app.settings.as_ref().unwrap().draft.user.sites.enabled);
         app.connected = false;
         let output = ui_frame(&mut app, &ctx, vec![]);
         click(
@@ -1234,17 +1232,8 @@ mod tests {
             &ctx,
             text_rect(&output, "SITE SPLIT TUNNELING").center(),
         );
-        assert!(
-            app.settings
-                .as_ref()
-                .unwrap()
-                .draft
-                .selected()
-                .unwrap()
-                .sites
-                .enabled
-        );
-        assert!(!app.library.selected().unwrap().sites.enabled);
+        assert!(app.settings.as_ref().unwrap().draft.user.sites.enabled);
+        assert!(!app.library.user.sites.enabled);
     }
 
     #[test]
@@ -1262,8 +1251,8 @@ mod tests {
         assert!(app.connected);
         assert_eq!(app.config, Some(path));
         assert!(app.protocol == Some(super::Protocol::AmneziaWg));
-        assert!(!app.library.effects);
-        assert!(!app.library.motion);
+        assert!(!app.library.user.effects);
+        assert!(!app.library.user.motion);
     }
 
     #[test]
@@ -1298,14 +1287,14 @@ mod tests {
     fn crt_glow_draws_real_text_halos_and_can_be_disabled() {
         let ctx = super::egui::Context::default();
         let mut app = super::NettVpn::default();
-        app.library.effects = false;
+        app.library.user.effects = false;
         let output = ui_frame(&mut app, &ctx, vec![]);
         let count = |output: &super::egui::FullOutput| {
             output.shapes.iter().filter(|s|matches!(&s.shape,super::egui::Shape::Text(t) if t.galley.job.text=="SETTINGS")).count()
         };
         assert_eq!(count(&output), 1);
-        app.library.effects = true;
-        app.library.motion = false;
+        app.library.user.effects = true;
+        app.library.user.motion = false;
         let output = ui_frame(&mut app, &ctx, vec![]);
         assert!(count(&output) >= 9);
     }

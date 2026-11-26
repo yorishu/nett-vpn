@@ -108,9 +108,12 @@ fn process_pattern(path: &str) -> String {
     pattern
 }
 
-pub fn configuration(profile: &Profile) -> Result<Value, String> {
-    validate_rules(&profile.sites, false)?;
-    validate_rules(&profile.apps, true)?;
+pub fn configuration(
+    profile: &Profile,
+    user: &crate::profiles::UserConfig,
+) -> Result<Value, String> {
+    validate_rules(&user.sites, false)?;
+    validate_rules(&user.apps, true)?;
     let mut interface = BTreeMap::new();
     let mut peers: Vec<BTreeMap<String, String>> = Vec::new();
     let mut section = 0;
@@ -291,7 +294,7 @@ pub fn configuration(profile: &Profile) -> Result<Value, String> {
         return Err("NO PEERS".into());
     }
     endpoint["peers"] = json!(peer_options);
-    let final_out = if [&profile.sites, &profile.apps]
+    let final_out = if [&user.sites, &user.apps]
         .iter()
         .any(|r| r.enabled && r.mode == Mode::ViaVpn)
     {
@@ -305,7 +308,7 @@ pub fn configuration(profile: &Profile) -> Result<Value, String> {
     ];
     let mut dns_rules = Vec::new();
     for mode in [Mode::Direct, Mode::ViaVpn] {
-        for (rules, apps) in [(&profile.sites, false), (&profile.apps, true)] {
+        for (rules, apps) in [(&user.sites, false), (&user.apps, true)] {
             if !rules.enabled || rules.mode != mode {
                 continue;
             }
@@ -344,7 +347,7 @@ pub fn configuration(profile: &Profile) -> Result<Value, String> {
         "dns":{"servers":[{"type":"local","tag":"dns-direct","detour":"direct"},{"type":"udp","tag":"dns-vpn","server":vpn_dns,"detour":"vpn"}],"rules":dns_rules,"final":format!("dns-{final_out}"),"strategy":"prefer_ipv4","reverse_mapping":true},
         "inbounds":[{"type":"tun","tag":"tun","interface_name":format!("nett-{}",profile.id),"address":["172.30.255.1/30","fdfe:dcba:9876::1/126"],"mtu":1400,"auto_route":true,"strict_route":true,"stack":"gvisor"}],
         "endpoints":[endpoint],"outbounds":[{"type":"direct","tag":"direct"}],
-        "route":{"auto_detect_interface":true,"find_process":profile.apps.enabled,"default_domain_resolver":"dns-direct","rules":route_rules,"final":final_out}
+        "route":{"auto_detect_interface":true,"find_process":user.apps.enabled,"default_domain_resolver":"dns-direct","rules":route_rules,"final":final_out}
     }))
 }
 
@@ -422,12 +425,12 @@ fn resolve_awg_endpoints(options: &mut Value) -> Result<(), String> {
 
 pub fn prepare(
     profile: &Profile,
-    strict: bool,
+    user: &crate::profiles::UserConfig,
     port: u16,
     password: &str,
 ) -> Result<Vec<std::net::SocketAddr>, String> {
-    if profile.apps.enabled
-        && profile
+    if user.apps.enabled
+        && user
             .apps
             .entries
             .iter()
@@ -440,10 +443,10 @@ pub fn prepare(
         return Err("SPLIT TUNNEL ALREADY RUNNING".into());
     }
     let engine = engine()?;
-    let mut options = configuration(profile)?;
+    let mut options = configuration(profile, user)?;
     resolve_awg_endpoints(&mut options)?;
     let peers = crate::network::resolve_peers(&mut options)?;
-    add_probe(&mut options, strict, port, password);
+    add_probe(&mut options, user.kill_switch, port, password);
     let config = path.with_extension("split.json");
     std::fs::write(
         &config,
@@ -531,7 +534,26 @@ pub fn stop(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     fn fixture() -> crate::profiles::Profile {
-        crate::profiles::Profile {id:"fixture".into(),name:"test".into(),config:"[Interface]\nPrivateKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress=10.0.0.2/32\nDNS=1.1.1.1\n[Peer]\nPublicKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nEndpoint=127.0.0.1:51820\nAllowedIPs=0.0.0.0/0,::/0".into(),sites:crate::profiles::Rules{enabled:true,mode:crate::profiles::Mode::ViaVpn,entries:vec!["example.com".into(),"192.168.10.0/24".into(),"host.ts.net:8766".into()]},apps:crate::profiles::Rules{enabled:true,mode:crate::profiles::Mode::Direct,entries:vec![r"C:\Apps\Discord.exe".into()]}}
+        crate::profiles::Profile {id:"fixture".into(),name:"test".into(),config:"[Interface]\nPrivateKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress=10.0.0.2/32\nDNS=1.1.1.1\n[Peer]\nPublicKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nEndpoint=127.0.0.1:51820\nAllowedIPs=0.0.0.0/0,::/0".into()}
+    }
+    fn user() -> crate::profiles::UserConfig {
+        crate::profiles::UserConfig {
+            sites: crate::profiles::Rules {
+                enabled: true,
+                mode: crate::profiles::Mode::ViaVpn,
+                entries: vec![
+                    "example.com".into(),
+                    "192.168.10.0/24".into(),
+                    "host.ts.net:8766".into(),
+                ],
+            },
+            apps: crate::profiles::Rules {
+                enabled: true,
+                mode: crate::profiles::Mode::Direct,
+                entries: vec![r"C:\Apps\Discord.exe".into()],
+            },
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -564,7 +586,7 @@ mod tests {
             } else {
                 "\nPersistentKeepalive=25"
             });
-            let mut config = super::configuration(&profile).unwrap();
+            let mut config = super::configuration(&profile, &user()).unwrap();
             super::add_probe(&mut config, awg, 51889, "test-password");
             config["log"] = serde_json::json!({"disabled":true});
             let path = root.join("test.json");
@@ -607,7 +629,7 @@ mod tests {
                 "[Interface]",
                 &format!("[Interface]\nJc=4\nDisableCookies={value}\nRandomTrailers={value}"),
             );
-            let config = super::configuration(&profile).unwrap();
+            let config = super::configuration(&profile, &user()).unwrap();
             for field in ["disable_cookies", "random_trailers"] {
                 assert_eq!(
                     config["endpoints"][0].get(field).and_then(|v| v.as_bool()),
@@ -620,7 +642,7 @@ mod tests {
         profile.config = profile
             .config
             .replace("[Interface]", "[Interface]\nJc=4\nDisableCookies=invalid");
-        assert!(super::configuration(&profile).is_err());
+        assert!(super::configuration(&profile, &user()).is_err());
     }
 
     #[test]
@@ -640,7 +662,7 @@ mod tests {
         );
         profile.config = profile.config.replace("127.0.0.1:51820", "localhost:51820");
         profile.config.push_str("\nPersistentKeepalive=25-35");
-        let mut options = super::configuration(&profile).unwrap();
+        let mut options = super::configuration(&profile, &user()).unwrap();
         super::resolve_awg_endpoints(&mut options).unwrap();
         let endpoints = options["endpoints"].clone();
         // No TUN inbound or auto_route: exercise AWG startup without changing host routes.
@@ -686,8 +708,24 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn global_rules_apply_to_different_vpn_configs() {
+        let first = fixture();
+        let mut second = fixture();
+        second.id = "other".into();
+        second.config = second.config.replace("[Interface]", "[Interface]\nJc=4");
+        let user = user();
+        let first_options = super::configuration(&first, &user).unwrap();
+        let second_options = super::configuration(&second, &user).unwrap();
+        assert_eq!(first_options["route"], second_options["route"]);
+        assert_eq!(first_options["dns"], second_options["dns"]);
+        assert_ne!(
+            first_options["endpoints"][0]["type"],
+            second_options["endpoints"][0]["type"]
+        );
+    }
+    #[test]
     fn verification_route_precedes_direct_rules_and_strict_dns_uses_vpn() {
-        let mut config = super::configuration(&fixture()).unwrap();
+        let mut config = super::configuration(&fixture(), &user()).unwrap();
         super::add_probe(&mut config, true, 51889, "test-password");
         let first = &config["route"]["rules"][0];
         assert_eq!(first["inbound"][0], "nett-health");
@@ -709,13 +747,13 @@ mod tests {
                 .replace("[Interface]", "[Interface]\nJc=4")
                 .replace("127.0.0.1:51820", &format!("{host}:51820"));
             let original = profile.config.clone();
-            let mut options = super::configuration(&profile).unwrap();
+            let mut options = super::configuration(&profile, &user()).unwrap();
             super::resolve_awg_endpoints(&mut options).unwrap();
             assert_eq!(options["endpoints"][0]["peers"][0]["address"], "127.0.0.1");
             assert_eq!(options["endpoints"][0]["peers"][0]["port"], 51820);
             assert_eq!(profile.config, original);
         }
-        let mut options = super::configuration(&fixture()).unwrap();
+        let mut options = super::configuration(&fixture(), &user()).unwrap();
         options["endpoints"][0]["peers"][0]["address"] = serde_json::json!("unchanged.invalid");
         super::resolve_awg_endpoints(&mut options).unwrap();
         assert_eq!(
@@ -747,7 +785,7 @@ mod tests {
                 profile
                     .config
                     .push_str(&format!("\nPersistentKeepalive={value}"));
-                let result = super::configuration(&profile);
+                let result = super::configuration(&profile, &user());
                 assert_eq!(result.is_ok(), valid, "awg={awg}, value={value}");
                 if awg && value == "25-35" {
                     assert_eq!(
@@ -781,8 +819,8 @@ mod tests {
     }
     #[test]
     fn direct_exclusions_precede_vpn_inclusions() {
-        let profile=crate::profiles::Profile {id:"test".into(),name:"test".into(),config:"[Interface]\nPrivateKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nEndpoint=1.2.3.4:51820\nAllowedIPs=0.0.0.0/0".into(),sites:crate::profiles::Rules{enabled:true,mode:crate::profiles::Mode::ViaVpn,entries:vec!["example.com".into()]},apps:crate::profiles::Rules{enabled:true,mode:crate::profiles::Mode::Direct,entries:vec![r"C:\Apps\Discord.exe".into()]}};
-        let result = super::configuration(&profile).unwrap();
+        let profile = fixture();
+        let result = super::configuration(&profile, &user()).unwrap();
         assert_eq!(result["route"]["final"], "direct");
         assert_eq!(result["route"]["rules"][2]["outbound"], "direct");
         assert_eq!(result["route"]["rules"][3]["outbound"], "vpn");
