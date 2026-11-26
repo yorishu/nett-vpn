@@ -1,6 +1,6 @@
 [package]
 name = "nett-vpn"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 
 [features]
@@ -13,4 +13,4 @@ rfd = "0.15"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tray-icon = "0.21"
-windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_System_Rpc", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }

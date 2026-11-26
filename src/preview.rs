@@ -29,12 +29,22 @@ pub fn app() -> super::NettVpn {
         selected: Some("preview".into()),
         effects: std::env::var_os("NETT_PREVIEW_CLEAN").is_none(),
         motion: screen == "glitch",
+        kill_switch: ["blocked", "wired"].contains(&screen.as_str()),
     };
     let mut app = super::NettVpn::default();
     app.protocol = Some(super::Protocol::AmneziaWg);
     app.message = "READY / OFFLINE".into();
     app.display_started = std::time::Instant::now() - std::time::Duration::from_secs_f64(6.8);
-    if !["home", "glitch"].contains(&screen.as_str()) {
+    app.connected = ["wired", "unverified"].contains(&screen.as_str());
+    app.verified = screen == "wired";
+    app.guarded = screen == "blocked";
+    if app.verified {
+        app.message = "VPN TUNNEL VERIFIED".into();
+    }
+    if app.guarded {
+        app.message = "VPN LOST - KILL SWITCH BLOCKING".into();
+    }
+    if !["home", "glitch", "wired", "unverified", "blocked"].contains(&screen.as_str()) {
         app.settings = Some(super::settings::Settings::preview(library.clone(), &screen));
     }
     app.library = library;

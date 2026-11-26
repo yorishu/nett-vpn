@@ -348,7 +348,7 @@ pub fn configuration(profile: &Profile) -> Result<Value, String> {
     }))
 }
 
-fn engine() -> Result<PathBuf, String> {
+pub(crate) fn engine() -> Result<PathBuf, String> {
     let path = std::env::current_exe()
         .map_err(|e| e.to_string())?
         .parent()
@@ -420,7 +420,12 @@ fn resolve_awg_endpoints(options: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
-pub fn start(profile: &Profile) -> Result<(), String> {
+pub fn prepare(
+    profile: &Profile,
+    strict: bool,
+    port: u16,
+    password: &str,
+) -> Result<Vec<std::net::SocketAddr>, String> {
     if profile.apps.enabled
         && profile
             .apps
@@ -437,6 +442,8 @@ pub fn start(profile: &Profile) -> Result<(), String> {
     let engine = engine()?;
     let mut options = configuration(profile)?;
     resolve_awg_endpoints(&mut options)?;
+    let peers = crate::network::resolve_peers(&mut options)?;
+    add_probe(&mut options, strict, port, password);
     let config = path.with_extension("split.json");
     std::fs::write(
         &config,
@@ -455,6 +462,25 @@ pub fn start(profile: &Profile) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         return Err("SPLIT CONFIG REJECTED BY ENGINE - SEE PROFILE LOG".into());
     }
+    Ok(peers)
+}
+
+fn add_probe(options: &mut Value, strict: bool, port: u16, password: &str) {
+    options["inbounds"].as_array_mut().unwrap().push(json!({"type":"socks","tag":"nett-health","listen":"127.0.0.1","listen_port":port,"users":[{"username":"nett","password":password}]}));
+    options["route"]["rules"].as_array_mut().unwrap().insert(
+        0,
+        json!({"inbound":["nett-health"],"action":"route","outbound":"vpn"}),
+    );
+    if strict {
+        options["dns"]["rules"] = json!([]);
+        options["dns"]["final"] = json!("dns-vpn");
+    }
+}
+
+// Called only by Nett's elevated controller; no nested UAC prompt.
+pub fn launch(path: &Path) -> Result<(), String> {
+    let engine = engine()?;
+    let config = path.with_extension("split.json");
     let ready = path.with_extension("ready.json");
     let stop = path.with_extension("stop");
     for p in [&ready, &stop] {
@@ -464,19 +490,17 @@ pub fn start(profile: &Profile) -> Result<(), String> {
             Err(e) => return Err(e.to_string()),
         }
     }
-    let script = "$ErrorActionPreference='Stop'; $argsText='run -c '+[char]34+$env:NETT_CONFIG+[char]34+' --nett-ready-file '+[char]34+$env:NETT_READY+[char]34+' --nett-stop-file '+[char]34+$env:NETT_STOP+[char]34; Start-Process -FilePath $env:NETT_ENGINE -ArgumentList $argsText -Verb RunAs -WindowStyle Hidden | Out-Null";
-    let status = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("NETT_ENGINE", engine)
-        .env("NETT_CONFIG", config)
-        .env("NETT_READY", ready)
-        .env("NETT_STOP", stop)
+    Command::new(engine)
+        .arg("run")
+        .arg("-c")
+        .arg(config)
+        .arg("--nett-ready-file")
+        .arg(ready)
+        .arg("--nett-stop-file")
+        .arg(stop)
         .creation_flags(0x08000000)
-        .status()
+        .spawn()
         .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("SPLIT START CANCELLED OR FAILED".into());
-    }
     let deadline = Instant::now() + Duration::from_secs(25);
     while Instant::now() < deadline {
         if running(&path) {
@@ -541,6 +565,7 @@ mod tests {
                 "\nPersistentKeepalive=25"
             });
             let mut config = super::configuration(&profile).unwrap();
+            super::add_probe(&mut config, awg, 51889, "test-password");
             config["log"] = serde_json::json!({"disabled":true});
             let path = root.join("test.json");
             std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -619,11 +644,12 @@ mod tests {
         super::resolve_awg_endpoints(&mut options).unwrap();
         let endpoints = options["endpoints"].clone();
         // No TUN inbound or auto_route: exercise AWG startup without changing host routes.
-        std::fs::write(
-            &config,
-            serde_json::to_vec(&serde_json::json!({"log":{"disabled":true},"endpoints":endpoints,"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}})).unwrap(),
-        )
-        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut route_free = serde_json::json!({"log":{"disabled":true},"inbounds":[],"dns":{},"endpoints":endpoints,"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[],"final":"direct"}});
+        super::add_probe(&mut route_free, false, port, "test-password");
+        std::fs::write(&config, serde_json::to_vec(&route_free).unwrap()).unwrap();
         let mut child = std::process::Command::new(engine)
             .args(["run", "-c"])
             .arg(config)
@@ -643,15 +669,36 @@ mod tests {
             let _ = child.wait();
             panic!("sidecar did not become ready");
         }
+        // The engine is alive but the fake peer cannot handshake: never report wired.
+        let unverified = crate::health::verify("unused", Some((port, "test-password"))).is_err();
         if let Err(e) = super::stop(&path) {
             let _ = child.kill();
             let _ = child.wait();
             panic!("{e}");
         }
         assert!(child.wait().unwrap().success());
+        assert!(
+            unverified,
+            "A running core without a real VPN peer must not pass verification"
+        );
         assert!(!super::running(&path));
         assert!(!path.with_extension("ready.json").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn verification_route_precedes_direct_rules_and_strict_dns_uses_vpn() {
+        let mut config = super::configuration(&fixture()).unwrap();
+        super::add_probe(&mut config, true, 51889, "test-password");
+        let first = &config["route"]["rules"][0];
+        assert_eq!(first["inbound"][0], "nett-health");
+        assert_eq!(first["outbound"], "vpn");
+        assert_eq!(config["dns"]["final"], "dns-vpn");
+        assert_eq!(config["dns"]["rules"], serde_json::json!([]));
+        assert_eq!(config["inbounds"][1]["listen"], "127.0.0.1");
+        assert_eq!(
+            config["inbounds"][1]["users"][0]["password"],
+            "test-password"
+        );
     }
     #[test]
     fn awg_hostname_is_resolved_without_changing_saved_config() {

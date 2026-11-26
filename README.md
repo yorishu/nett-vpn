@@ -10,7 +10,7 @@
           [ tunnel terminal / windows x64 ]
 ```
 
-![build](https://img.shields.io/badge/build-0.2.5-9cff44?style=flat-square&labelColor=141d18)
+![build](https://img.shields.io/badge/build-0.2.6-9cff44?style=flat-square&labelColor=141d18)
 ![Rust](https://img.shields.io/badge/client-Rust-9cff44?style=flat-square&labelColor=141d18&logo=rust)
 ![Windows](https://img.shields.io/badge/platform-Windows_x64-9cff44?style=flat-square&labelColor=141d18)
 ![WG + AWG](https://img.shields.io/badge/tunnels-WireGuard_%2B_AmneziaWG-9cff44?style=flat-square&labelColor=141d18)
@@ -34,7 +34,7 @@ No browser shell. No Go installation needed to run it. VPN engines live beside t
 ## 01 // b00t
 
 ```text
-> download  nett-v0.2.5-windows-x64.zip
+> download  nett-v0.2.6-windows-x64.zip
 > extract   the whole archive
 > launch    nett.exe
 > import    your .conf
@@ -66,13 +66,20 @@ Before upgrading, exit the previous copy through `qu1t`. Do not run two Nett ins
 | `SAVE & APPLY` | Save settings; `DISPLAY` saves display preferences only |
 | `BACK` | Return; confirm before discarding unsaved changes |
 | `F8` | Toggle CRT effects immediately |
+| `kill switch [X]` | Arm strict protection for the next connection; disconnect before changing |
 | `HIDE` / `CLOSE` | Hide the window; keep the tunnel running |
 | Tray → `s33` | Restore the window |
 | Tray → `qu1t` | Stop the tunnel, then exit |
 
 Profile and routing edits are locked while connected. Display preferences are saved independently and do not restart the VPN. Importing a profile also saves the current draft. Split lists are saved independently of engine validation; a connection error never clears saved rules. Successful saves retain the current settings tab. AWG boolean fields support on/off, yes/no, true/false and 1/0; empty optional fields are treated as unset. AWG PersistentKeepalive ranges such as 25-35 are preserved by the bundled split core; off disables keepalive.
 
-The tray **k** is white when inactive and green when an engine is running. `wired` reports engine state, not a verified remote handshake. A failed disconnect or cancelled UAC leaves Nett open with an error instead of silently exiting.
+The tray **k** turns green and the title reports `wired` only after a TCP connection succeeds through the VPN. A running engine with a failed probe remains unverified; DISCONNECT stays available. Probes repeat in the background approximately every three seconds, with bounded timeouts. The probe tries `1.1.1.1:443` and `1.0.0.1:443`; profiles that cannot reach either destination remain unverified even if a private-network tunnel works. A failed disconnect or cancelled UAC leaves Nett open with an error instead of silently exiting.
+
+Split tunnels use an authenticated, loopback-only probe listener pinned to the VPN outbound before user routing rules. Native tunnels bind the probe to their Windows interface. Neither probe falls back to direct internet.
+
+The red kill switch is off by default. Enable it before CONNECT. Its persistent Windows Filtering Platform filters arm before engine startup and block ordinary IPv4/IPv6 traffic in both directions outside the selected VPN, including DIRECTLY exceptions. VPN peer UDP endpoints, localhost, DHCP and link-local IPv6 discovery remain available; ordinary direct DNS is blocked, and split DNS uses VPN. If the engine or client crashes, filtering remains in place. Manual DISCONNECT and tray `qu1t` stop the tunnel and release filtering. HIDE/CLOSE keep it active.
+
+After a crash, reopen Nett and use DISCONNECT or turn off the red switch to release protection. If the UI cannot open, run PowerShell from the application directory: `Start-Process .\nett.exe -ArgumentList '--nett-network clear _global' -Verb RunAs -Wait -WindowStyle Hidden`. This explicitly removes Nett's filters; it does not remove other firewall rules.
 
 ## 03 // r0ut3
 
@@ -135,12 +142,12 @@ cargo test --release --locked -- --include-ignored
 
 The script verifies the upstream archive checksum and applies the small lifecycle patch. Engine readiness includes PID and process creation time. A stop request calls the engine's normal cleanup path instead of abruptly killing it. Go is a build dependency for this sidecar only; Nett's UI stays Rust.
 
-The test suite covers encrypted persistence, routing config generation, UI clicks and layout, display changes during an active connection, and tray lifecycle logic. Optional engine tests validate generated WG/AWG configs and start/stop a route-free instance. Live VPN traffic is not covered by these tests.
+The test suite covers encrypted persistence, routing config generation, UI clicks and layout, display changes during an active connection, tray lifecycle, failed verification and probe interface binding. Optional engine tests validate generated WG/AWG configs and start/stop a route-free instance. The two optional WFP tests require an elevated PowerShell: one aborts the complete filter transaction, the other blocks only a temporary localhost port and removes its rules automatically. Live VPN traffic and a complete real-server outage are not covered by these tests.
 
 Isolated screenshot mode never opens the real vault or creates a tray:
 
 ```powershell
-$env:NETT_PREVIEW_SCREEN = 'home' # profiles / sites / apps / display / glitch
+$env:NETT_PREVIEW_SCREEN = 'home' # profiles / sites / apps / display / glitch / wired / unverified / blocked
 $env:EFRAME_SCREENSHOT_TO = "$PWD/preview.png"
 cargo run --release --features ui-preview
 ```

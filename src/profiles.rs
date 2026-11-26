@@ -65,6 +65,7 @@ pub struct Library {
     pub selected: Option<String>,
     pub effects: bool,
     pub motion: bool,
+    pub kill_switch: bool,
 }
 impl Default for Library {
     fn default() -> Self {
@@ -73,6 +74,7 @@ impl Default for Library {
             selected: None,
             effects: true,
             motion: true,
+            kill_switch: false,
         }
     }
 }
@@ -218,6 +220,7 @@ mod tests {
     #[test]
     fn selection_and_metadata_survive_serialization() {
         let mut library = super::Library::default();
+        library.kill_switch = true;
         library.profiles.push(super::Profile {
             id: "n123".into(),
             name: "home".into(),
@@ -231,6 +234,9 @@ mod tests {
         copy.validate().unwrap();
         assert_eq!(copy.selected().unwrap().name, "home");
         assert_eq!(copy.selected().unwrap().config, "secret");
+        assert!(copy.kill_switch);
+        let legacy: super::Library = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.kill_switch);
         library.profiles[0].id = "../escape".into();
         assert!(library.validate().is_err());
     }

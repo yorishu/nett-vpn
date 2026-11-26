@@ -2,6 +2,9 @@
 #![cfg_attr(feature = "ui-preview", allow(dead_code))]
 
 mod crt;
+mod firewall;
+mod health;
+mod network;
 #[cfg(feature = "ui-preview")]
 mod preview;
 mod profiles;
@@ -25,7 +28,7 @@ const SCREEN: Color32 = Color32::from_rgb(16, 27, 20);
 const LIME: Color32 = Color32::from_rgb(156, 255, 68);
 const DIM: Color32 = Color32::from_rgb(128, 172, 104);
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 enum Protocol {
     WireGuard,
     AmneziaWg,
@@ -35,6 +38,7 @@ enum Completion {
     Cancelled,
     Toggled(bool),
     DisplaySaved(bool, bool),
+    KillSwitch(bool),
     Library(
         profiles::Library,
         Option<(PathBuf, Protocol, bool)>,
@@ -51,12 +55,14 @@ struct NettVpn {
     config: Option<PathBuf>,
     protocol: Option<Protocol>,
     connected: bool,
+    verified: bool,
+    guarded: bool,
     message: String,
     pending: Option<Receiver<Result<Completion, String>>>,
     tray: Option<tray::Tray>,
     quit_requested: bool,
     allow_close: bool,
-    status: Option<Receiver<bool>>,
+    status: Option<Receiver<(bool, bool, bool, Option<String>)>>,
     last_status: std::time::Instant,
 }
 
@@ -76,6 +82,8 @@ impl Default for NettVpn {
             config: None,
             protocol: None,
             connected: false,
+            verified: false,
+            guarded: false,
             message: "IMPORT A .CONF CONFIG TO BEGIN".into(),
         }
     }
@@ -92,6 +100,7 @@ impl NettVpn {
             return;
         }
         let (tx, rx) = mpsc::channel();
+        self.status = None;
         self.pending = Some(rx);
         self.message = message.into();
         let ctx = ctx.clone();
@@ -111,6 +120,16 @@ impl NettVpn {
         };
         self.pending = None;
         match result {
+            Ok(Completion::KillSwitch(enabled)) => {
+                self.library.kill_switch = enabled;
+                self.guarded = false;
+                self.message = if enabled {
+                    "KILL SWITCH ARMED FOR NEXT CONNECTION"
+                } else {
+                    "KILL SWITCH OFF"
+                }
+                .into();
+            }
             Ok(Completion::DisplaySaved(effects, motion)) => {
                 self.library.effects = effects;
                 self.library.motion = motion;
@@ -129,6 +148,7 @@ impl NettVpn {
                 self.config = active.as_ref().map(|a| a.0.clone());
                 self.protocol = active.as_ref().map(|a| a.1);
                 self.connected = active.is_some_and(|a| a.2);
+                self.verified = false;
                 if let Some(settings) = &mut self.settings {
                     settings.accept_saved(library.clone());
                 }
@@ -143,13 +163,17 @@ impl NettVpn {
             Ok(Completion::Cancelled) => self.message = "IMPORT CANCELLED".into(),
             Ok(Completion::Toggled(connected)) => {
                 self.connected = connected;
+                self.verified = false;
+                if !connected {
+                    self.guarded = false;
+                }
                 if self.quit_requested && !connected {
                     self.allow_close = true;
                 }
                 self.message = if connected {
-                    "TUNNEL SERVICE STARTED"
+                    "CHECKING VPN TUNNEL..."
                 } else {
-                    "TUNNEL SERVICE STOPPED"
+                    "VPN DISCONNECTED - KILL SWITCH RELEASED"
                 }
                 .into();
             }
@@ -161,7 +185,7 @@ impl NettVpn {
     }
 
     fn import(&mut self, ctx: &egui::Context) {
-        if self.connected {
+        if self.connected || self.guarded {
             return;
         }
         let mut library = self
@@ -187,8 +211,9 @@ impl NettVpn {
         let (Some(path), Some(protocol)) = (self.config.clone(), self.protocol) else {
             return;
         };
-        let connected = self.connected;
+        let connected = self.connected || self.guarded;
         let profile = self.library.selected().cloned();
+        let kill_switch = self.library.kill_switch;
         self.start(
             ctx,
             if connected {
@@ -197,34 +222,29 @@ impl NettVpn {
                 "CONNECTING..."
             },
             move || {
-                if connected && split::running(&path) {
-                    split::stop(&path)?;
+                if connected {
+                    network::stop(&path, protocol)?;
                     return Ok(Completion::Toggled(false));
                 }
-                if !connected
-                    && let Some(profile) = profile
-                    && profile.split()
-                {
-                    split::start(&profile)?;
-                    return Ok(Completion::Toggled(true));
-                }
-                let engine = engine_path(protocol).ok_or_else(|| match protocol {
-                    Protocol::WireGuard => "WIREGUARD FOR WINDOWS NOT FOUND".to_string(),
-                    Protocol::AmneziaWg => "AMNEZIAWG FOR WINDOWS NOT FOUND".to_string(),
-                })?;
-                let (verb, arg) = if connected {
-                    ("/uninstalltunnelservice", tunnel_name(&path))
-                } else {
-                    ("/installtunnelservice", path.to_string_lossy().into_owned())
-                };
-                elevate_engine(&engine, verb, &arg)?;
-                let running = tunnel_running(protocol, &path);
-                if running == connected {
-                    return Err("TUNNEL SERVICE DID NOT CHANGE STATE".into());
-                }
-                Ok(Completion::Toggled(running))
+                network::connect(&profile.ok_or("PROFILE NOT FOUND")?, kill_switch)?;
+                Ok(Completion::Toggled(true))
             },
         );
+    }
+
+    fn toggle_kill_switch(&mut self, ctx: &egui::Context) {
+        if self.connected || self.pending.is_some() {
+            return;
+        }
+        let mut library = self.library.clone();
+        library.kill_switch = !self.guarded && !library.kill_switch;
+        self.start(ctx, "UPDATING KILL SWITCH...", move || {
+            if !library.kill_switch {
+                network::clear()?;
+            }
+            library.save()?;
+            Ok(Completion::KillSwitch(library.kill_switch))
+        });
     }
 }
 
@@ -243,9 +263,10 @@ fn library_completion(mut library: profiles::Library) -> Result<Completion, Stri
         library.selected = Some(active);
     }
     let selection = if let Some(profile) = library.selected() {
-        let path = profile.stage()?;
+        let path = profile.path()?;
         let protocol = profile.protocol();
         let connected = connection_running(protocol, &path);
+        let path = if connected { path } else { profile.stage()? };
         Some((path, protocol, connected))
     } else {
         None
@@ -258,6 +279,9 @@ fn connection_running(protocol: Protocol, path: &Path) -> bool {
 }
 
 fn ensure_editable(library: &profiles::Library) -> Result<(), String> {
+    if network::guarded() {
+        return Err("DISCONNECT TO RELEASE KILL SWITCH BEFORE EDITING".into());
+    }
     for profile in &library.profiles {
         if connection_running(profile.protocol(), &profile.path()?) {
             return Err("DISCONNECT BEFORE EDITING PROFILES OR RULES".into());
@@ -373,26 +397,6 @@ fn tunnel_running(protocol: Protocol, path: &Path) -> bool {
     output.status.success() && String::from_utf8_lossy(&output.stdout).contains(": 4")
 }
 
-fn elevate_engine(engine: &Path, verb: &str, argument: &str) -> Result<(), String> {
-    let script = "$ErrorActionPreference = 'Stop'; $arg = $env:NETT_VERB + ' \"' + $env:NETT_ARGUMENT + '\"'; $p = Start-Process -FilePath $env:NETT_ENGINE -ArgumentList $arg -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode";
-    let status = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("NETT_ENGINE", engine)
-        .env("NETT_VERB", verb)
-        .env("NETT_ARGUMENT", argument)
-        .creation_flags(0x08000000)
-        .status()
-        .map_err(|e| format!("CANNOT START VPN ENGINE - {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "ENGINE FAILED - EXIT {}",
-            status.code().unwrap_or(-1)
-        ))
-    }
-}
-
 impl eframe::App for NettVpn {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0; 4]
@@ -415,43 +419,101 @@ impl NettVpn {
             if tray.quit.try_recv().is_ok() {
                 self.quit_requested = true;
             }
-            if let Err(error) = tray.update(self.connected) {
+            if let Err(error) = tray.update(self.verified) {
                 self.message = error;
             }
         }
         if self.quit_requested && self.pending.is_none() {
-            if self.allow_close || self.config.is_none() {
+            if self.allow_close {
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if self.config.is_none() {
+                self.start(ctx, "RELEASING KILL SWITCH...", || {
+                    if network::guarded() {
+                        network::clear()?;
+                    }
+                    Ok(Completion::Toggled(false))
+                });
             } else if let (Some(path), Some(protocol)) = (self.config.clone(), self.protocol) {
                 self.start(ctx, "STOPPING TUNNEL...", move || {
-                    split::stop(&path)?;
-                    if tunnel_running(protocol, &path) {
-                        let engine = engine_path(protocol).ok_or("VPN ENGINE NOT FOUND")?;
-                        elevate_engine(&engine, "/uninstalltunnelservice", &tunnel_name(&path))?;
-                        if tunnel_running(protocol, &path) {
-                            return Err("TUNNEL STILL RUNNING - EXIT CANCELLED".into());
-                        }
-                    }
+                    network::stop(&path, protocol)?;
                     Ok(Completion::Toggled(false))
                 });
             }
         }
         if self.pending.is_none() && !self.quit_requested {
             if let Some(rx) = &self.status {
-                if let Ok(connected) = rx.try_recv() {
+                let update = match rx.try_recv() {
+                    Ok(status) => Some(status),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some((
+                        self.connected,
+                        false,
+                        self.guarded,
+                        Some("VPN STATUS CHECK FAILED".into()),
+                    )),
+                };
+                if let Some((connected, verified, guarded, error)) = update {
+                    let was_verified = self.verified;
                     self.connected = connected;
+                    self.verified = verified;
+                    self.guarded = guarded;
+                    if verified {
+                        if !was_verified {
+                            self.message = "VPN TUNNEL VERIFIED".into();
+                        }
+                    } else if let Some(error) = error {
+                        self.message = error;
+                    } else if was_verified {
+                        self.message = if guarded {
+                            "VPN LOST - KILL SWITCH BLOCKING"
+                        } else {
+                            "VPN DISCONNECTED"
+                        }
+                        .into();
+                    }
                     self.status = None;
                 }
             }
             if self.status.is_none() && self.last_status.elapsed() >= Duration::from_secs(3) {
                 self.last_status = std::time::Instant::now();
-                if let (Some(path), Some(protocol)) = (self.config.clone(), self.protocol) {
+                {
+                    let selection = self.config.clone().zip(self.protocol);
                     let (tx, rx) = mpsc::channel();
                     self.status = Some(rx);
                     let ctx = ctx.clone();
                     std::thread::spawn(move || {
-                        let _ = tx.send(connection_running(protocol, &path));
+                        let guarded = network::guarded();
+                        let Some((path, protocol)) = selection else {
+                            let _ = tx.send((
+                                false,
+                                false,
+                                guarded,
+                                if guarded {
+                                    Some("VPN LOST - KILL SWITCH BLOCKING".into())
+                                } else {
+                                    None
+                                },
+                            ));
+                            ctx.request_repaint();
+                            return;
+                        };
+                        let running = connection_running(protocol, &path);
+                        let probe = if running {
+                            network::verify(&path)
+                        } else {
+                            Err("VPN NOT RUNNING".into())
+                        };
+                        let verified =
+                            running && probe.is_ok() && connection_running(protocol, &path);
+                        let error = if running {
+                            probe.err()
+                        } else if guarded {
+                            Some("VPN LOST - KILL SWITCH BLOCKING".into())
+                        } else {
+                            None
+                        };
+                        let _ = tx.send((running, verified, guarded, error));
                         ctx.request_repaint();
                     });
                 }
@@ -465,8 +527,12 @@ impl NettVpn {
                 "nett - {}{dots}",
                 self.message.trim_end_matches('.').to_lowercase()
             )
-        } else if self.connected {
+        } else if self.verified {
             "nett - wired".into()
+        } else if self.connected {
+            format!("nett - checking{dots}")
+        } else if self.guarded {
+            "nett - blocked".into()
         } else {
             format!("nett - waiting{dots}")
         };
@@ -548,7 +614,7 @@ impl NettVpn {
                 if self.settings.is_some() {
                     let action = self.settings.as_mut().unwrap().show(
                         ui,
-                        self.connected,
+                        self.connected || self.guarded,
                         self.pending.is_some(),
                     );
                     match action {
@@ -633,7 +699,7 @@ impl NettVpn {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        RichText::new("WINDOWS - BUILD 0.2.5")
+                                        RichText::new("WINDOWS - BUILD 0.2.6")
                                             .font(FontId::monospace(11.0))
                                             .color(DIM),
                                     );
@@ -650,13 +716,17 @@ impl NettVpn {
                                 ui.set_min_height(250.0);
                                 ui.set_min_width(ui.available_width());
                                 ui.label(
-                                    RichText::new(if self.connected {
+                                    RichText::new(if self.verified {
                                         "[+] LINK ACTIVE"
+                                    } else if self.connected {
+                                        "[?] LINK UNVERIFIED"
+                                    } else if self.guarded {
+                                        "[!] TRAFFIC BLOCKED"
                                     } else {
                                         "[-] LINK OFFLINE"
                                     })
                                     .font(FontId::monospace(13.0))
-                                    .color(if self.connected { LIME } else { DIM })
+                                    .color(if self.verified { LIME } else if self.guarded { Color32::LIGHT_RED } else { DIM })
                                     .strong(),
                                 );
                                 ui.add_space(6.0);
@@ -677,7 +747,7 @@ impl NettVpn {
                                     }
                                     if ui
                                         .add_enabled_ui(
-                                            self.pending.is_none() && !self.connected,
+                                            self.pending.is_none() && !self.connected && !self.guarded,
                                             |ui| {
                                                 ui.add_sized(
                                                     [120.0, 32.0],
@@ -756,7 +826,7 @@ impl NettVpn {
                                 ui.add_space(18.0);
                                 let label = if self.pending.is_some() {
                                     "WORKING..."
-                                } else if self.connected {
+                                } else if self.connected || self.guarded {
                                     "DISCONNECT"
                                 } else {
                                     "CONNECT"
@@ -778,7 +848,8 @@ impl NettVpn {
                                 {
                                     self.toggle(ctx);
                                 }
-                                ui.add_space(16.0);
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(
                                         if self.library.selected().is_some_and(|p| p.split()) {
@@ -791,6 +862,17 @@ impl NettVpn {
                                     .size(10.0)
                                     .color(DIM),
                                 );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let label = if self.library.kill_switch { "kill switch [X]" } else { "kill switch [ ]" };
+                                    let button = egui::Button::new(RichText::new(label).monospace().color(Color32::LIGHT_RED))
+                                        .fill(Color32::from_rgb(43, 23, 24))
+                                        .stroke(Stroke::new(1.0_f32, Color32::LIGHT_RED))
+                                        .min_size(Vec2::new(132.0, 24.0));
+                                    if ui.add_enabled(!self.connected && self.pending.is_none(), button)
+                                        .on_hover_text("Strict: blocks all traffic outside this VPN, including DIRECTLY. Arms on CONNECT; releases on DISCONNECT or qu1t. Disconnect before changing.")
+                                        .clicked() { self.toggle_kill_switch(ctx); }
+                                });
+                                });
                             });
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
@@ -854,6 +936,9 @@ fn terminal_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result<()> {
+    if let Some(code) = network::dispatch() {
+        std::process::exit(code);
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([660.0, 490.0])
@@ -902,6 +987,41 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_status_worker_revokes_verified_state_without_losing_disconnect() {
+        let ctx = super::egui::Context::default();
+        let mut app = super::NettVpn::default();
+        app.connected = true;
+        app.verified = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        app.status = Some(rx);
+        ui_frame(&mut app, &ctx, vec![]);
+        assert!(!app.verified);
+        assert!(app.connected);
+        assert_eq!(app.message, "VPN STATUS CHECK FAILED");
+    }
+    #[test]
+    fn running_engine_is_not_displayed_as_wired_without_verified_probe() {
+        let ctx = super::egui::Context::default();
+        let mut app = super::NettVpn::default();
+        app.connected = true;
+        let output = ui_frame(&mut app, &ctx, vec![]);
+        text_rect(&output, "[?] LINK UNVERIFIED");
+        text_rect(&output, "  DISCONNECT  ");
+        let switch = text_rect(&output, "kill switch [ ]");
+        assert!(switch.right() < 642.0 && switch.bottom() < 472.0);
+        app.verified = true;
+        let output = ui_frame(&mut app, &ctx, vec![]);
+        text_rect(&output, "[+] LINK ACTIVE");
+        app.verified = false;
+        app.connected = false;
+        app.guarded = true;
+        let output = ui_frame(&mut app, &ctx, vec![]);
+        text_rect(&output, "[!] TRAFFIC BLOCKED");
+        text_rect(&output, "  DISCONNECT  ");
+    }
+
     #[test]
     fn failed_operation_preserves_rules_and_unsaved_draft() {
         let mut app = super::NettVpn::default();
