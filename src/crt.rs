@@ -63,14 +63,14 @@ pub fn paint(ctx: &egui::Context, rect: egui::Rect, elapsed: f64, motion: bool) 
     for (clip, text) in &texts {
         let glow = painter.with_clip_rect(clip.intersect(inner));
         for (x, y, alpha) in [
-            (-1.0, 0.0, 38),
-            (1.0, 0.0, 38),
-            (0.0, -1.0, 30),
-            (0.0, 1.0, 30),
-            (-2.5, 0.0, 12),
-            (2.5, 0.0, 12),
-            (0.0, -2.5, 10),
-            (0.0, 2.5, 10),
+            (-0.6, 0.0, 12),
+            (0.6, 0.0, 12),
+            (0.0, -0.6, 10),
+            (0.0, 0.6, 10),
+            (-1.4, 0.0, 3),
+            (1.4, 0.0, 3),
+            (0.0, -1.4, 3),
+            (0.0, 1.4, 3),
         ] {
             let mut copy = text.clone();
             copy.pos += egui::vec2(x, y);
