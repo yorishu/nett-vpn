@@ -1,5 +1,16 @@
 use crate::{Color32, LIME, egui};
 
+fn glass_point(rect: egui::Rect, point: egui::Pos2) -> egui::Pos2 {
+    let offset = point - rect.center();
+    let x = offset.x / (rect.width() * 0.5);
+    let y = offset.y / (rect.height() * 0.5);
+    rect.center()
+        + egui::vec2(
+            offset.x * (1.0 - 0.025 * y * y),
+            offset.y * (1.0 - 0.025 * x * x),
+        )
+}
+
 fn vignette(rect: egui::Rect) -> egui::epaint::Mesh {
     let mut mesh = egui::epaint::Mesh::default();
     const COLS: usize = 24;
@@ -63,14 +74,14 @@ pub fn paint(ctx: &egui::Context, rect: egui::Rect, elapsed: f64, motion: bool) 
     for (clip, text) in &texts {
         let glow = painter.with_clip_rect(clip.intersect(inner));
         for (x, y, alpha) in [
-            (-0.6, 0.0, 12),
-            (0.6, 0.0, 12),
-            (0.0, -0.6, 10),
-            (0.0, 0.6, 10),
-            (-1.4, 0.0, 3),
-            (1.4, 0.0, 3),
-            (0.0, -1.4, 3),
-            (0.0, 1.4, 3),
+            (-1.0, 0.0, 19),
+            (1.0, 0.0, 19),
+            (0.0, -1.0, 15),
+            (0.0, 1.0, 15),
+            (-2.5, 0.0, 6),
+            (2.5, 0.0, 6),
+            (0.0, -2.5, 5),
+            (0.0, 2.5, 5),
         ] {
             let mut copy = text.clone();
             copy.pos += egui::vec2(x, y);
@@ -81,25 +92,43 @@ pub fn paint(ctx: &egui::Context, rect: egui::Rect, elapsed: f64, motion: bool) 
     // Paint-only effects leave all hit targets and keyboard focus unchanged.
     let mut y = inner.top();
     while y < inner.bottom() {
-        painter.hline(
-            inner.x_range(),
-            y,
+        painter.add(egui::Shape::line(
+            (0..=24)
+                .map(|i| {
+                    glass_point(
+                        inner,
+                        egui::pos2(inner.left() + inner.width() * i as f32 / 24.0, y),
+                    )
+                })
+                .collect(),
             egui::Stroke::new(1.0_f32, Color32::from_black_alpha(44)),
-        );
-        painter.hline(
-            inner.x_range(),
-            y + 1.0,
+        ));
+        painter.add(egui::Shape::line(
+            (0..=24)
+                .map(|i| {
+                    glass_point(
+                        inner,
+                        egui::pos2(inner.left() + inner.width() * i as f32 / 24.0, y + 1.0),
+                    )
+                })
+                .collect(),
             egui::Stroke::new(0.5_f32, Color32::from_rgba_unmultiplied(156, 255, 68, 8)),
-        );
+        ));
         y += 3.0;
     }
     let mut x = inner.left();
     while x < inner.right() {
-        painter.vline(
-            x,
-            inner.y_range(),
+        painter.add(egui::Shape::line(
+            (0..=20)
+                .map(|i| {
+                    glass_point(
+                        inner,
+                        egui::pos2(x, inner.top() + inner.height() * i as f32 / 20.0),
+                    )
+                })
+                .collect(),
             egui::Stroke::new(1.0_f32, Color32::from_black_alpha(8)),
-        );
+        ));
         x += 3.0;
     }
     painter.add(egui::Shape::mesh(vignette(inner)));
@@ -176,6 +205,33 @@ pub fn paint(ctx: &egui::Context, rect: egui::Rect, elapsed: f64, motion: bool) 
     }
 }
 
+pub fn pixel_burst(ctx: &egui::Context, origin: egui::Pos2, elapsed: f32) {
+    if !(0.0..0.55).contains(&elapsed) {
+        return;
+    }
+    let progress = elapsed / 0.55;
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("kill-switch-burst"),
+    ));
+    for i in 0..16 {
+        let angle = i as f32 * std::f32::consts::TAU / 16.0;
+        let distance = progress * (30.0 + (i % 3) as f32 * 12.0);
+        let offset = egui::vec2(
+            angle.cos() * distance,
+            angle.sin() * distance + progress * progress * 16.0,
+        );
+        let center = origin + (offset / 4.0).round() * 4.0;
+        let size = if progress < 0.6 { 8.0 } else { 4.0 };
+        painter.rect_filled(
+            egui::Rect::from_center_size(center, egui::vec2(size, size)),
+            0.0,
+            Color32::from_rgba_unmultiplied(255, 48, 48, ((1.0 - progress) * 230.0) as u8),
+        );
+    }
+    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+}
+
 pub fn reduced_motion() -> bool {
     let mut animations = 1i32;
     unsafe {
@@ -191,6 +247,77 @@ pub fn reduced_motion() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pixel_burst_has_large_red_squares_and_expires() {
+        use crate::egui;
+        let frame = |elapsed| {
+            let ctx = egui::Context::default();
+            ctx.run(egui::RawInput::default(), |ctx| {
+                super::pixel_burst(ctx, egui::pos2(100.0, 100.0), elapsed);
+            })
+        };
+        let output = frame(0.1);
+        assert_eq!(output.shapes.len(), 16);
+        for shape in output.shapes {
+            let egui::Shape::Rect(square) = shape.shape else {
+                panic!("expected pixel")
+            };
+            assert_eq!(square.rect.size(), egui::vec2(8.0, 8.0));
+            assert!(square.fill.r() > square.fill.g() * 4);
+        }
+        assert!(frame(0.6).shapes.is_empty());
+    }
+
+    #[test]
+    fn glass_curvature_keeps_center_and_gently_bends_edges() {
+        let rect = crate::egui::Rect::from_min_size(
+            crate::egui::Pos2::ZERO,
+            crate::egui::vec2(660.0, 490.0),
+        );
+        assert_eq!(super::glass_point(rect, rect.center()), rect.center());
+        let corner = super::glass_point(rect, rect.left_top());
+        assert!(corner.x > rect.left() && corner.y > rect.top());
+        assert!(corner.distance(rect.left_top()) < 11.0);
+        assert_eq!(
+            super::glass_point(rect, rect.center_top()),
+            rect.center_top()
+        );
+    }
+
+    #[test]
+    fn single_sweep_moves_at_original_speed() {
+        use crate::egui;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(660.0, 490.0));
+        let bands = |elapsed, motion| {
+            let ctx = egui::Context::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                super::paint(ctx, rect, elapsed, motion);
+            });
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|s| {
+                    if let egui::Shape::Rect(r) = s.shape {
+                        if (r.rect.width() - (rect.width() - 16.0)).abs() < 0.001
+                            && (r.rect.height() - 2.0).abs() < 0.001
+                        {
+                            return Some(r.rect.top());
+                        }
+                    }
+                    None
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = bands(0.6, true);
+        let after = bands(0.7, true);
+        assert_eq!(before.len(), 12);
+        assert_eq!(after.len(), before.len());
+        for (a, b) in before.iter().zip(&after) {
+            assert!((b - a - (rect.height() - 16.0) * 0.1 / 5.5).abs() < 0.001);
+        }
+        assert!(bands(0.6, false).is_empty());
+    }
+
     #[test]
     fn vignette_is_transparent_at_center_and_darker_at_edges() {
         let rect = crate::egui::Rect::from_min_size(

@@ -52,6 +52,7 @@ struct NettVpn {
     library: profiles::Library,
     settings: Option<settings::Settings>,
     display_started: std::time::Instant,
+    kill_burst_started: Option<std::time::Instant>,
     reduced_motion: bool,
     config: Option<PathBuf>,
     protocol: Option<Protocol>,
@@ -73,6 +74,7 @@ impl Default for NettVpn {
             library: Default::default(),
             settings: None,
             display_started: std::time::Instant::now(),
+            kill_burst_started: None,
             reduced_motion: crt::reduced_motion(),
             tray: None,
             quit_requested: false,
@@ -129,6 +131,7 @@ impl NettVpn {
                 self.message = "USER CONFIG SAVED - APPLIES TO ALL VPN PROFILES".into();
             }
             Ok(Completion::KillSwitch(enabled)) => {
+                self.kill_burst_started = Some(std::time::Instant::now());
                 self.library.user.kill_switch = enabled;
                 self.guarded = false;
                 self.message = if enabled {
@@ -715,7 +718,7 @@ impl NettVpn {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        RichText::new("WINDOWS - BUILD 0.2.8")
+                                        RichText::new("WINDOWS - BUILD 1.0.0")
                                             .font(FontId::monospace(11.0))
                                             .color(DIM),
                                     );
@@ -884,9 +887,17 @@ impl NettVpn {
                                         .fill(Color32::from_rgb(43, 23, 24))
                                         .stroke(Stroke::new(1.0_f32, Color32::LIGHT_RED))
                                         .min_size(Vec2::new(132.0, 24.0));
-                                    if ui.add_enabled(!self.connected && self.pending.is_none(), button)
-                                        .on_hover_text("Protects VPN traffic without blocking DIRECTLY through the split core. If the core crashes, traffic stays blocked until recovery or DISCONNECT. Arms on CONNECT; releases on DISCONNECT or qu1t.")
-                                        .clicked() { self.toggle_kill_switch(ctx); }
+                                    let response = ui.add_enabled(!self.connected && self.pending.is_none(), button)
+                                        .on_hover_text("Protects VPN traffic without blocking DIRECTLY through the split core. If the core crashes, traffic stays blocked until recovery or DISCONNECT. Arms on CONNECT; releases on DISCONNECT or qu1t.");
+                                    if response.clicked() { self.toggle_kill_switch(ctx); }
+                                    if self.library.user.effects && self.library.user.motion && !self.reduced_motion {
+                                        if let Some(started) = self.kill_burst_started {
+                                            let font = egui::TextStyle::Monospace.resolve(ui.style());
+                                            let text = ui.painter().layout_no_wrap(label.into(), font, Color32::LIGHT_RED);
+                                            let origin = response.rect.center() + egui::vec2(text.size().x * (0.5 - 1.5 / label.len() as f32), 0.0);
+                                            crt::pixel_burst(ctx, origin, started.elapsed().as_secs_f32());
+                                        }
+                                    }
                                 });
                                 });
                             });

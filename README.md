@@ -10,7 +10,7 @@
           [ tunnel terminal / windows x64 ]
 ```
 
-![build](https://img.shields.io/badge/build-0.2.8-9cff44?style=flat-square&labelColor=141d18)
+![build](https://img.shields.io/badge/build-1.0.0-9cff44?style=flat-square&labelColor=141d18)
 ![Rust](https://img.shields.io/badge/client-Rust-9cff44?style=flat-square&labelColor=141d18&logo=rust)
 ![Windows](https://img.shields.io/badge/platform-Windows_x64-9cff44?style=flat-square&labelColor=141d18)
 ![WG + AWG](https://img.shields.io/badge/tunnels-WireGuard_%2B_AmneziaWG-9cff44?style=flat-square&labelColor=141d18)
@@ -34,7 +34,7 @@ No browser shell. No Go installation needed to run it. VPN engines live beside t
 ## 01 // b00t
 
 ```text
-> download  nett-v0.2.8-windows-x64.zip
+> download  nett-v1.0.0-windows-x64.zip
 > extract   the whole archive
 > launch    nett.exe
 > import    your .conf
@@ -129,7 +129,7 @@ Exit the old client through `qu1t` before upgrading. Older clients do not read t
 
 Engines also need working `.conf` / `.json` files. These files and logs can contain keys or network metadata; their directory ACL permits the current user, SYSTEM and administrators. Do not publish this directory or copy it into an issue.
 
-CRT overlays do not capture clicks or keyboard focus. Windows reduced-motion preferences disable the animations. Ordinary labels cannot be selected; input fields retain normal editing.
+CRT overlays do not capture clicks or keyboard focus. The phosphor glow runs at half its original opacity, with a gently curved raster and one sweep at the original speed. A short burst of large red pixels marks a successful kill-switch toggle. DISPLAY preferences and Windows reduced-motion settings control animations. Ordinary labels cannot be selected; input fields retain normal editing.
 
 ## 05 // d3v
 
