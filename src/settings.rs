@@ -243,7 +243,7 @@ impl Settings {
                         Err(e) => self.error = e,
                     }
                 } else {
-                    match self.draft.validate() {
+                    match self.draft.validate_vpn() {
                         Ok(()) => action = Some(Action::Save(self.draft.clone())),
                         Err(e) => self.error = e,
                     }

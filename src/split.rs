@@ -244,9 +244,6 @@ pub fn configuration(
         if port == 0 {
             return Err("INVALID PEER PORT".into());
         }
-        if awg && host.starts_with('[') {
-            return Err("SPLIT AWG REQUIRES AN IPV4 OR DOMAIN ENDPOINT".into());
-        }
         let mut p = json!({"address":host.trim_matches(['[',']']),"port":port,"public_key":peer.get("publickey").ok_or("PEER PUBLIC KEY MISSING")?,"allowed_ips":list(peer.get("allowedips"))});
         if p["allowed_ips"].as_array().is_none_or(|a| a.is_empty()) {
             return Err("PEER ALLOWED IPS MISSING".into());
@@ -397,30 +394,20 @@ pub fn running(path: &Path) -> bool {
     }
 }
 
-fn resolve_awg_endpoints(options: &mut Value) -> Result<(), String> {
-    use std::net::ToSocketAddrs;
-    for endpoint in options["endpoints"]
-        .as_array_mut()
-        .ok_or("ENDPOINTS MISSING")?
-    {
-        if endpoint["type"] != "awg" {
-            continue;
-        }
-        for peer in endpoint["peers"].as_array_mut().ok_or("PEERS MISSING")? {
-            let host = peer["address"].as_str().ok_or("PEER ADDRESS MISSING")?;
-            if host.parse::<std::net::Ipv4Addr>().is_ok() {
-                continue;
-            }
-            let port = peer["port"].as_u64().ok_or("PEER PORT MISSING")? as u16;
-            let address = (host, port)
-                .to_socket_addrs()
-                .map_err(|_| "VPN SERVER DNS LOOKUP FAILED - CHECK DIRECT INTERNET AND DNS")?
-                .find(|address| address.is_ipv4())
-                .ok_or("SPLIT AWG SERVER HAS NO IPV4 ADDRESS")?;
-            peer["address"] = json!(address.ip().to_string());
+fn adapt_direct_dns(options: &mut Value, ipv6_available: bool) {
+    if ipv6_available {
+        return;
+    }
+    let direct_final = options["dns"]["final"] == "dns-direct";
+    let rules = options["dns"]["rules"].as_array_mut().unwrap();
+    for rule in rules.iter_mut() {
+        if rule["server"] == "dns-direct" {
+            rule["strategy"] = json!("ipv4_only");
         }
     }
-    Ok(())
+    if direct_final {
+        rules.push(json!({"action":"route","server":"dns-direct","strategy":"ipv4_only"}));
+    }
 }
 
 pub fn prepare(
@@ -444,7 +431,7 @@ pub fn prepare(
     }
     let engine = engine()?;
     let mut options = configuration(profile, user)?;
-    resolve_awg_endpoints(&mut options)?;
+    adapt_direct_dns(&mut options, crate::network::direct_ipv6_available()?);
     let peers = crate::network::resolve_peers(&mut options)?;
     let direct_dns = user.kill_switch.then(crate::network::direct_dns_server);
     add_probe(&mut options, direct_dns.as_deref(), port, password);
@@ -538,6 +525,28 @@ pub fn stop(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_dns_avoids_ipv6_without_changing_vpn_dns_or_dual_stack() {
+        let original = serde_json::json!({"dns":{"final":"dns-vpn","rules":[
+            {"domain_suffix":["direct.example"],"action":"route","server":"dns-direct"},
+            {"domain_suffix":["vpn.example"],"action":"route","server":"dns-vpn"}
+        ]}});
+        let mut config = original.clone();
+        super::adapt_direct_dns(&mut config, true);
+        assert_eq!(config, original);
+        super::adapt_direct_dns(&mut config, false);
+        assert_eq!(config["dns"]["rules"][0]["strategy"], "ipv4_only");
+        assert_eq!(config["dns"]["rules"][1], original["dns"]["rules"][1]);
+        assert_eq!(config["dns"]["final"], "dns-vpn");
+        assert_eq!(config["dns"]["rules"].as_array().unwrap().len(), 2);
+        config["dns"]["final"] = serde_json::json!("dns-direct");
+        super::adapt_direct_dns(&mut config, false);
+        assert_eq!(
+            config["dns"]["rules"][2],
+            serde_json::json!({"action":"route","server":"dns-direct","strategy":"ipv4_only"})
+        );
+    }
+
     fn fixture() -> crate::profiles::Profile {
         crate::profiles::Profile {id:"fixture".into(),name:"test".into(),config:"[Interface]\nPrivateKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress=10.0.0.2/32\nDNS=1.1.1.1\n[Peer]\nPublicKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nEndpoint=127.0.0.1:51820\nAllowedIPs=0.0.0.0/0,::/0".into()}
     }
@@ -592,6 +601,7 @@ mod tests {
                 "\nPersistentKeepalive=25"
             });
             let mut config = super::configuration(&profile, &user()).unwrap();
+            super::adapt_direct_dns(&mut config, false);
             super::add_probe(
                 &mut config,
                 awg.then_some("192.0.2.53"),
@@ -659,63 +669,71 @@ mod tests {
     #[ignore = "requires the compiled Amnezia Box sidecar"]
     fn split_sidecar_stops_gracefully_without_installing_routes() {
         use std::os::windows::process::CommandExt;
-        let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(r"engines\AmneziaBox\nett-split-core.exe");
-        let root = std::env::temp_dir().join(format!("nett-box-lifecycle-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("test.conf");
-        let config = root.join("test.json");
-        let mut profile = fixture();
-        profile.config = profile.config.replace(
-            "[Interface]",
-            "[Interface]\nJc=4\nDisableCookies=on\nRandomTrailers=on",
-        );
-        profile.config = profile.config.replace("127.0.0.1:51820", "localhost:51820");
-        profile.config.push_str("\nPersistentKeepalive=25-35");
-        let mut options = super::configuration(&profile, &user()).unwrap();
-        super::resolve_awg_endpoints(&mut options).unwrap();
-        let endpoints = options["endpoints"].clone();
-        // No TUN inbound or auto_route: exercise AWG startup without changing host routes.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let mut route_free = serde_json::json!({"log":{"disabled":true},"inbounds":[],"dns":{},"endpoints":endpoints,"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[],"final":"direct"}});
-        super::add_probe(&mut route_free, None, port, "test-password");
-        std::fs::write(&config, serde_json::to_vec(&route_free).unwrap()).unwrap();
-        let mut child = std::process::Command::new(engine)
-            .args(["run", "-c"])
-            .arg(config)
-            .arg("--nett-ready-file")
-            .arg(path.with_extension("ready.json"))
-            .arg("--nett-stop-file")
-            .arg(path.with_extension("stop"))
-            .creation_flags(0x08000000)
-            .spawn()
-            .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !super::running(&path) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        for awg in [false, true] {
+            let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(r"engines\AmneziaBox\nett-split-core.exe");
+            let root = std::env::temp_dir()
+                .join(format!("nett-box-lifecycle-{}-{awg}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("test.conf");
+            let config = root.join("test.json");
+            let mut profile = fixture();
+            if awg {
+                profile.config = profile.config.replace(
+                    "[Interface]",
+                    "[Interface]\nJc=4\nDisableCookies=on\nRandomTrailers=on",
+                );
+                profile.config = profile.config.replace("127.0.0.1:51820", "localhost:51820");
+                profile.config.push_str("\nPersistentKeepalive=25-35");
+            } else {
+                profile.config.push_str("\nPersistentKeepalive=25");
+            }
+            let mut options = super::configuration(&profile, &user()).unwrap();
+            crate::network::resolve_peers(&mut options).unwrap();
+            let endpoints = options["endpoints"].clone();
+            // No TUN inbound or auto_route: exercise WG/AWG startup without changing host routes.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let mut route_free = serde_json::json!({"log":{"disabled":true},"inbounds":[],"dns":{},"endpoints":endpoints,"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[],"final":"direct"}});
+            super::add_probe(&mut route_free, None, port, "test-password");
+            std::fs::write(&config, serde_json::to_vec(&route_free).unwrap()).unwrap();
+            let mut child = std::process::Command::new(engine)
+                .args(["run", "-c"])
+                .arg(config)
+                .arg("--nett-ready-file")
+                .arg(path.with_extension("ready.json"))
+                .arg("--nett-stop-file")
+                .arg(path.with_extension("stop"))
+                .creation_flags(0x08000000)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !super::running(&path) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if !super::running(&path) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("sidecar did not become ready");
+            }
+            // The engine is alive but the fake peer cannot handshake: never report wired.
+            let unverified =
+                crate::health::verify("unused", Some((port, "test-password"))).is_err();
+            if let Err(e) = super::stop(&path) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{e}");
+            }
+            assert!(child.wait().unwrap().success());
+            assert!(
+                unverified,
+                "A running core without a real VPN peer must not pass verification"
+            );
+            assert!(!super::running(&path));
+            assert!(!path.with_extension("ready.json").exists());
+            std::fs::remove_dir_all(root).unwrap();
         }
-        if !super::running(&path) {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("sidecar did not become ready");
-        }
-        // The engine is alive but the fake peer cannot handshake: never report wired.
-        let unverified = crate::health::verify("unused", Some((port, "test-password"))).is_err();
-        if let Err(e) = super::stop(&path) {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("{e}");
-        }
-        assert!(child.wait().unwrap().success());
-        assert!(
-            unverified,
-            "A running core without a real VPN peer must not pass verification"
-        );
-        assert!(!super::running(&path));
-        assert!(!path.with_extension("ready.json").exists());
-        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn global_rules_apply_to_different_vpn_configs() {
@@ -752,7 +770,7 @@ mod tests {
     }
     #[test]
     fn awg_hostname_is_resolved_without_changing_saved_config() {
-        for host in ["localhost", "127.0.0.1"] {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
             let mut profile = fixture();
             profile.config = profile
                 .config
@@ -760,18 +778,18 @@ mod tests {
                 .replace("127.0.0.1:51820", &format!("{host}:51820"));
             let original = profile.config.clone();
             let mut options = super::configuration(&profile, &user()).unwrap();
-            super::resolve_awg_endpoints(&mut options).unwrap();
-            assert_eq!(options["endpoints"][0]["peers"][0]["address"], "127.0.0.1");
+            crate::network::resolve_peers(&mut options).unwrap();
+            assert_eq!(
+                options["endpoints"][0]["peers"][0]["address"],
+                if host == "[::1]" { "::1" } else { "127.0.0.1" }
+            );
             assert_eq!(options["endpoints"][0]["peers"][0]["port"], 51820);
             assert_eq!(profile.config, original);
         }
         let mut options = super::configuration(&fixture(), &user()).unwrap();
-        options["endpoints"][0]["peers"][0]["address"] = serde_json::json!("unchanged.invalid");
-        super::resolve_awg_endpoints(&mut options).unwrap();
-        assert_eq!(
-            options["endpoints"][0]["peers"][0]["address"],
-            "unchanged.invalid"
-        );
+        options["endpoints"][0]["peers"][0]["address"] = serde_json::json!("::1");
+        crate::network::resolve_peers(&mut options).unwrap();
+        assert_eq!(options["endpoints"][0]["peers"][0]["address"], "::1");
     }
     #[test]
     fn keepalive_preserves_awg_ranges_and_validates_bounds() {

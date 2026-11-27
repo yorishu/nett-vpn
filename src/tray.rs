@@ -9,6 +9,23 @@ fn restore_window(hwnd: isize) {
         SetForegroundWindow(hwnd as _);
     }
 }
+
+pub(crate) fn restore_existing() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW};
+    unsafe extern "system" fn visit(hwnd: windows_sys::Win32::Foundation::HWND, _: isize) -> i32 {
+        let mut title = [0u16; 256];
+        let length = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
+        if length > 0 && String::from_utf16_lossy(&title[..length as usize]).starts_with("nett - ")
+        {
+            restore_window(hwnd as isize);
+            return 0;
+        }
+        1
+    }
+    unsafe {
+        EnumWindows(Some(visit), 0);
+    }
+}
 use std::sync::mpsc::{self, Receiver};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,

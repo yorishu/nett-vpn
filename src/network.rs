@@ -34,12 +34,7 @@ impl Plan {
 }
 
 fn profile_path(id: &str) -> Result<PathBuf, String> {
-    if id.is_empty()
-        || id.len() > 15
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
+    if !crate::profiles::valid_id(id) {
         return Err("INVALID NETWORK PROFILE ID".into());
     }
     Ok(crate::storage::root()?.join(format!("{id}.conf")))
@@ -82,16 +77,49 @@ pub fn resolve_peers(options: &mut Value) -> Result<Vec<SocketAddr>, String> {
             let host = peer["address"].as_str().ok_or("PEER ADDRESS MISSING")?;
             let port = u16::try_from(peer["port"].as_u64().ok_or("PEER PORT MISSING")?)
                 .map_err(|_| "INVALID PEER PORT")?;
-            let address = (host, port)
+            let addresses: Vec<_> = (host, port)
                 .to_socket_addrs()
                 .map_err(|_| "VPN SERVER DNS LOOKUP FAILED")?
+                .collect();
+            let address = addresses
+                .iter()
                 .find(|a| !awg || a.is_ipv4())
+                .or_else(|| addresses.first())
+                .copied()
                 .ok_or("VPN SERVER ADDRESS UNAVAILABLE")?;
             peer["address"] = serde_json::json!(address.ip().to_string());
             peers.push(address);
         }
     }
     Ok(peers)
+}
+
+pub(crate) fn direct_ipv6_available() -> Result<bool, String> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::*;
+    use windows_sys::Win32::Networking::WinSock::AF_INET6;
+    unsafe {
+        let mut table = std::ptr::null_mut();
+        if GetIpForwardTable2(AF_INET6, &mut table) != 0 {
+            return Err("CANNOT QUERY DIRECT IPV6 ROUTES".into());
+        }
+        let routes = std::slice::from_raw_parts(
+            std::ptr::addr_of!((*table).Table).cast::<MIB_IPFORWARD_ROW2>(),
+            (*table).NumEntries as usize,
+        );
+        let available = routes.iter().any(|route| {
+            if route.DestinationPrefix.PrefixLength != 0 || route.Loopback != 0 {
+                return false;
+            }
+            let mut alias = [0u16; 257];
+            ConvertInterfaceLuidToAlias(&route.InterfaceLuid, alias.as_mut_ptr(), alias.len()) == 0
+                && !String::from_utf16_lossy(
+                    &alias[..alias.iter().position(|c| *c == 0).unwrap_or(alias.len())],
+                )
+                .starts_with("nett-")
+        });
+        FreeMibTable(table.cast());
+        Ok(available)
+    }
 }
 
 pub(crate) fn direct_dns_server() -> String {
@@ -129,9 +157,13 @@ pub(crate) fn direct_dns_server() -> String {
     "1.1.1.1".into()
 }
 
+pub(crate) fn uses_core(protocol: Protocol, user: &crate::profiles::UserConfig) -> bool {
+    protocol == Protocol::AmneziaWg || user.split()
+}
+
 pub fn connect(profile: &Profile, user: &crate::profiles::UserConfig) -> Result<(), String> {
     let path = profile.stage()?;
-    let split = user.split();
+    let split = uses_core(profile.protocol(), user);
     let kill_switch = user.kill_switch;
     let mut password = [0u8; 16];
     unsafe {
@@ -217,6 +249,77 @@ pub fn stop(path: &Path, protocol: Protocol) -> Result<(), String> {
     }
     elevate("stop", &crate::tunnel_name(path))
 }
+fn sessions(root: &Path) -> Result<Vec<(std::path::PathBuf, Plan)>, String> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut sessions = Vec::new();
+    let mut legacy = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".network.json")) else {
+            if let Some(name) = name.to_str()
+                && name.to_ascii_lowercase().ends_with(".conf")
+                && let Some((id, _)) = name.rsplit_once('.')
+                && crate::profiles::valid_id(id)
+            {
+                legacy.push((id.to_owned(), entry.path()));
+            }
+            continue;
+        };
+        if !crate::profiles::valid_id(id) {
+            return Err("INVALID NETWORK PROFILE ID".into());
+        }
+        let path = root.join(format!("{id}.conf"));
+        let plan: Plan =
+            serde_json::from_slice(&fs::read(entry.path()).map_err(|e| e.to_string())?)
+                .map_err(|_| "INVALID NETWORK SESSION")?;
+        if plan.id != id {
+            return Err("INVALID NETWORK SESSION".into());
+        }
+        sessions.push((path, plan));
+    }
+    // Older clients had no session metadata. Use filenames, never read their keys.
+    for (id, path) in legacy {
+        if sessions
+            .iter()
+            .any(|(_, plan)| plan.id.eq_ignore_ascii_case(&id))
+        {
+            continue;
+        }
+        let protocol = if crate::tunnel_running(Protocol::AmneziaWg, &path) {
+            Protocol::AmneziaWg
+        } else {
+            Protocol::WireGuard
+        };
+        sessions.push((
+            path.clone(),
+            Plan {
+                id,
+                protocol,
+                split: crate::split::running(&path),
+                kill_switch: false,
+                peers: Vec::new(),
+                probe_port: None,
+                probe_password: String::new(),
+            },
+        ));
+    }
+    Ok(sessions)
+}
+pub fn stop_all() -> Result<(), String> {
+    if !guarded()
+        && sessions(&crate::storage::root()?)?
+            .iter()
+            .all(|(path, plan)| !crate::connection_running(plan.protocol, path))
+    {
+        return Ok(());
+    }
+    elevate("stop-all", "_global")
+}
 pub fn clear() -> Result<(), String> {
     elevate("clear", "_global")
 }
@@ -288,19 +391,15 @@ fn controller(action: &str, path: &Path) -> Result<(), String> {
     if action == "clear" {
         return release_guard();
     }
+    if action == "stop-all" {
+        for (path, plan) in sessions(&crate::storage::root()?)? {
+            stop_engine(&plan, &path)?;
+        }
+        return release_guard();
+    }
     let plan = read_plan(path)?;
     if action == "stop" {
-        crate::split::stop(path)?;
-        if crate::tunnel_running(plan.protocol, path) {
-            native_engine(&plan, false)?;
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while crate::tunnel_running(plan.protocol, path) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if crate::tunnel_running(plan.protocol, path) {
-                return Err("TUNNEL STILL RUNNING - KILL SWITCH RETAINED".into());
-            }
-        }
+        stop_engine(&plan, path)?;
         return release_guard();
     }
     if action != "connect" {
@@ -337,6 +436,21 @@ fn controller(action: &str, path: &Path) -> Result<(), String> {
     Err("VPN INTERFACE DID NOT START - DISCONNECT TO RELEASE KILL SWITCH".into())
 }
 
+fn stop_engine(plan: &Plan, path: &Path) -> Result<(), String> {
+    crate::split::stop(path)?;
+    if crate::tunnel_running(plan.protocol, path) {
+        native_engine(plan, false)?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while crate::tunnel_running(plan.protocol, path) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if crate::tunnel_running(plan.protocol, path) {
+            return Err("TUNNEL STILL RUNNING - KILL SWITCH RETAINED".into());
+        }
+    }
+    Ok(())
+}
+
 fn native_engine(plan: &Plan, start: bool) -> Result<(), String> {
     let engine = crate::engine_path(plan.protocol).ok_or("VPN ENGINE NOT FOUND")?;
     let status = Command::new(engine)
@@ -366,9 +480,45 @@ fn native_engine(plan: &Plan, start: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn awg_uses_updated_core_even_without_split_rules() {
+        let mut user = crate::profiles::UserConfig::default();
+        assert!(!user.split());
+        assert!(super::uses_core(crate::Protocol::AmneziaWg, &user));
+        assert!(!super::uses_core(crate::Protocol::WireGuard, &user));
+        user.sites.enabled = true;
+        assert!(super::uses_core(crate::Protocol::WireGuard, &user));
+        assert!(super::uses_core(crate::Protocol::AmneziaWg, &user));
+    }
+    #[test]
+    fn recovery_inventory_works_without_vault_and_rejects_mismatched_sessions() {
+        let root = std::env::temp_dir().join(format!("nett-recovery-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("old.vpn.network.json");
+        let mut plan = serde_json::json!({"id":"old.vpn","protocol":"WireGuard","split":false,"kill_switch":true,"peers":[],"probe_port":null,"probe_password":""});
+        std::fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        let sessions = super::sessions(&root).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0, root.join("old.vpn.conf"));
+        std::fs::write(
+            root.join("legacy+1.CONF"),
+            b"contents intentionally not parsed",
+        )
+        .unwrap();
+        let recovered = super::sessions(&root).unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered.iter().any(|(_, plan)| plan.id == "legacy+1"));
+        plan["id"] = serde_json::json!("different");
+        std::fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        assert!(super::sessions(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn controller_rejects_path_traversal_before_elevation() {
         for id in ["../test", "a/b", "C:\\evil", "", "a b", "aaaaaaaaaaaaaaaa"] {
             assert!(super::profile_path(id).is_err());
+        }
+        for id in ["old.vpn", "old+vpn=1", "_global"] {
+            assert!(super::profile_path(id).is_ok());
         }
     }
     #[test]

@@ -50,6 +50,7 @@ enum Completion {
 
 struct NettVpn {
     library: profiles::Library,
+    library_available: bool,
     settings: Option<settings::Settings>,
     display_started: std::time::Instant,
     kill_burst_started: Option<std::time::Instant>,
@@ -72,6 +73,7 @@ impl Default for NettVpn {
     fn default() -> Self {
         Self {
             library: Default::default(),
+            library_available: true,
             settings: None,
             display_started: std::time::Instant::now(),
             kill_burst_started: None,
@@ -150,6 +152,7 @@ impl NettVpn {
                 self.message = "DISPLAY SETTINGS SAVED".into();
             }
             Ok(Completion::Library(library, active, warning)) => {
+                self.library_available = true;
                 self.message = warning.unwrap_or_else(|| {
                     library
                         .selected()
@@ -196,7 +199,7 @@ impl NettVpn {
     }
 
     fn import(&mut self, ctx: &egui::Context) {
-        if self.connected || self.guarded {
+        if !self.library_available || self.connected || self.guarded {
             return;
         }
         let mut library = self.library.clone();
@@ -243,17 +246,17 @@ impl NettVpn {
     }
 
     fn toggle_kill_switch(&mut self, ctx: &egui::Context) {
-        if self.connected || self.pending.is_some() {
+        if !self.library_available || self.connected || self.pending.is_some() {
             return;
         }
-        let mut library = self.library.clone();
-        library.user.kill_switch = !self.guarded && !library.user.kill_switch;
+        let mut user = self.library.user.clone();
+        user.kill_switch = !self.guarded && !user.kill_switch;
         self.start(ctx, "UPDATING KILL SWITCH...", move || {
-            if !library.user.kill_switch {
+            if !user.kill_switch {
                 network::clear()?;
             }
-            library.user.save()?;
-            Ok(Completion::KillSwitch(library.user.kill_switch))
+            user.save()?;
+            Ok(Completion::KillSwitch(user.kill_switch))
         });
     }
 }
@@ -276,7 +279,6 @@ fn library_completion(mut library: profiles::Library) -> Result<Completion, Stri
         let path = profile.path()?;
         let protocol = profile.protocol();
         let connected = connection_running(protocol, &path);
-        let path = if connected { path } else { profile.stage()? };
         Some((path, protocol, connected))
     } else {
         None
@@ -300,26 +302,29 @@ fn ensure_editable(library: &profiles::Library) -> Result<(), String> {
     Ok(())
 }
 
-fn detect_config(path: &Path) -> Result<Protocol, String> {
-    let size = std::fs::metadata(path)
-        .map_err(|e| format!("CANNOT READ CONFIG - {e}"))?
-        .len();
-    if size > 1024 * 1024 {
+fn read_config(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(1024 * 1024 + 1).read_to_string(&mut text))
+        .map_err(|e| format!("CANNOT READ CONFIG - {e}"))?;
+    if text.len() > 1024 * 1024 {
         return Err("CONFIG TOO LARGE - MAX 1 MB".into());
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("CANNOT READ CONFIG - {e}"))?;
+    if text.starts_with('\u{feff}') {
+        text.drain(..3);
+    }
     let mut section = "";
     let mut interface = false;
     let mut peer = false;
     let mut private_key = false;
     let mut public_key = false;
     let mut endpoint = false;
-    let mut awg = false;
     // shortcut: checks protocol markers only; the official tunnel engine validates the full config.
     for line in text
         .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
     {
         if line.starts_with('[') {
             section = if line.eq_ignore_ascii_case("[Interface]") {
@@ -345,25 +350,12 @@ fn detect_config(path: &Path) -> Result<Protocol, String> {
             if section == "peer" && key.eq_ignore_ascii_case("Endpoint") && !value.is_empty() {
                 endpoint = true;
             }
-            if section == "interface"
-                && [
-                    "Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4",
-                ]
-                .iter()
-                .any(|k| key.eq_ignore_ascii_case(k))
-            {
-                awg = true;
-            }
         }
     }
     if !(interface && peer && private_key && public_key && endpoint) {
         return Err("INVALID CONFIG - CHECK INTERFACE, PEER, KEYS AND ENDPOINT".into());
     }
-    Ok(if awg {
-        Protocol::AmneziaWg
-    } else {
-        Protocol::WireGuard
-    })
+    Ok(text)
 }
 
 fn engine_path(protocol: Protocol) -> Option<PathBuf> {
@@ -439,9 +431,7 @@ impl NettVpn {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else if self.config.is_none() {
                 self.start(ctx, "RELEASING KILL SWITCH...", || {
-                    if network::guarded() {
-                        network::clear()?;
-                    }
+                    network::stop_all()?;
                     Ok(Completion::Toggled(false))
                 });
             } else if let (Some(path), Some(protocol)) = (self.config.clone(), self.protocol) {
@@ -625,7 +615,7 @@ impl NettVpn {
                     let action = self.settings.as_mut().unwrap().show(
                         ui,
                         self.connected || self.guarded,
-                        self.pending.is_some(),
+                        self.pending.is_some() || !self.library_available,
                     );
                     match action {
                         Some(settings::Action::SaveUser(user)) => {
@@ -637,11 +627,11 @@ impl NettVpn {
                             });
                         }
                         Some(settings::Action::SaveDisplay(effects, motion)) => {
-                            let mut library = self.library.clone();
-                            library.user.effects = effects;
-                            library.user.motion = motion;
+                            let mut user = self.library.user.clone();
+                            user.effects = effects;
+                            user.motion = motion;
                             self.start(ctx, "SAVING DISPLAY...", move || {
-                                library.user.save()?;
+                                user.save()?;
                                 Ok(Completion::DisplaySaved(effects, motion))
                             });
                         }
@@ -670,7 +660,7 @@ impl NettVpn {
                                     !library.vpn.profiles.iter().any(|new| new.id == old.id)
                                 }) {
                                     for ext in
-                                        ["conf", "split.json", "split.log", "ready.json", "stop"]
+                                        ["conf", "split.json", "split.log", "ready.json", "stop", "network.json", "network-result.json"]
                                     {
                                         match std::fs::remove_file(
                                             removed.path()?.with_extension(ext),
@@ -718,7 +708,7 @@ impl NettVpn {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        RichText::new("WINDOWS - BUILD 1.0.0")
+                                        RichText::new("WINDOWS - BUILD 1.0.1")
                                             .font(FontId::monospace(11.0))
                                             .color(DIM),
                                     );
@@ -751,14 +741,13 @@ impl NettVpn {
                                 ui.add_space(6.0);
                                 ui.vertical(|ui| {
                                     if ui
-                                        .add_sized(
+                                        .add_enabled_ui(self.library_available, |ui| ui.add_sized(
                                             [120.0, 32.0],
                                             egui::Button::new(
                                                 RichText::new("SETTINGS").monospace().color(LIME),
                                             )
                                             .fill(PANEL),
-                                        )
-                                        .clicked()
+                                        )).inner.clicked()
                                     {
                                         self.settings =
                                             Some(settings::Settings::new(self.library.clone()));
@@ -766,7 +755,7 @@ impl NettVpn {
                                     }
                                     if ui
                                         .add_enabled_ui(
-                                            self.pending.is_none() && !self.connected && !self.guarded,
+                                            self.library_available && self.pending.is_none() && !self.connected && !self.guarded,
                                             |ui| {
                                                 ui.add_sized(
                                                     [120.0, 32.0],
@@ -871,8 +860,8 @@ impl NettVpn {
                                 ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(
-                                        if self.library.user.split() {
-                                            "ENGINE: NETT SPLIT CORE - UAC REQUIRED"
+                                        if network::uses_core(self.protocol.unwrap_or(Protocol::WireGuard), &self.library.user) {
+                                            "ENGINE: NETT CORE - UAC REQUIRED"
                                         } else {
                                             "ENGINE: WINDOWS TUNNEL SERVICE - UAC REQUIRED"
                                         },
@@ -887,7 +876,7 @@ impl NettVpn {
                                         .fill(Color32::from_rgb(43, 23, 24))
                                         .stroke(Stroke::new(1.0_f32, Color32::LIGHT_RED))
                                         .min_size(Vec2::new(132.0, 24.0));
-                                    let response = ui.add_enabled(!self.connected && self.pending.is_none(), button)
+                                    let response = ui.add_enabled(self.library_available && !self.connected && self.pending.is_none(), button)
                                         .on_hover_text("Protects VPN traffic without blocking DIRECTLY through the split core. If the core crashes, traffic stays blocked until recovery or DISCONNECT. Arms on CONNECT; releases on DISCONNECT or qu1t.");
                                     if response.clicked() { self.toggle_kill_switch(ctx); }
                                     if self.library.user.effects && self.library.user.motion && !self.reduced_motion {
@@ -966,6 +955,13 @@ fn main() -> eframe::Result<()> {
     if let Some(code) = network::dispatch() {
         std::process::exit(code);
     }
+    #[cfg(not(feature = "ui-preview"))]
+    let Some(_instance) = storage::InstanceGuard::acquire("Local\\nett-vpn")
+        .map_err(|e| eframe::Error::AppCreation(e.into()))?
+    else {
+        tray::restore_existing();
+        return Ok(());
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([660.0, 490.0])
@@ -1002,6 +998,7 @@ fn main() -> eframe::Result<()> {
             #[cfg(not(feature = "ui-preview"))]
             {
                 let mut app = NettVpn::default();
+                app.library_available = false;
                 app.tray = Some(tray::Tray::new(cc)?);
                 app.start(&cc.egui_ctx, "LOADING PROFILES...", || {
                     library_completion(profiles::Library::load()?)
@@ -1014,6 +1011,69 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_import_accepts_bom_comments_and_bounds_the_actual_read() {
+        let root = std::env::temp_dir().join(format!("nett-import-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("test.conf");
+        std::fs::write(&path, "\u{feff}[Interface] # comment\nPrivateKey=fake\nDisableCookies=on\n[Peer]\nPublicKey=fake\nEndpoint=127.0.0.1:1").unwrap();
+        let config = super::read_config(&path).unwrap();
+        assert!(!config.starts_with('\u{feff}'));
+        assert!(super::profiles::detect_protocol(&config) == super::Protocol::AmneziaWg);
+        std::fs::write(&path, vec![b'a'; 1024 * 1024 + 1]).unwrap();
+        assert!(super::read_config(&path).unwrap_err().contains("MAX 1 MB"));
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(super::read_config(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn loading_saved_metadata_does_not_write_a_working_config() {
+        let id = format!("t{:x}", std::process::id());
+        let profile = super::profiles::Profile {
+            id: id.clone(),
+            name: "metadata only".into(),
+            config: "not staged until connect".into(),
+        };
+        let path = profile.path().unwrap();
+        assert!(!path.exists());
+        let library = super::profiles::Library {
+            vpn: super::profiles::VpnConfig {
+                profiles: vec![profile],
+                selected: Some(id),
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            super::library_completion(library),
+            Ok(super::Completion::Library(_, Some(_), None))
+        ));
+        assert!(!path.exists());
+    }
+    #[test]
+    fn failed_library_load_cannot_overwrite_saved_configs() {
+        let ctx = super::egui::Context::default();
+        let mut app = super::NettVpn {
+            library_available: false,
+            ..Default::default()
+        };
+        let frame = ui_frame(&mut app, &ctx, vec![]);
+        let settings = text_rect(&frame, "SETTINGS");
+        click(&mut app, &ctx, settings.center());
+        assert!(app.settings.is_none());
+        app.import(&ctx);
+        app.toggle_kill_switch(&ctx);
+        assert!(app.pending.is_none());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(super::Completion::Library(
+            Default::default(),
+            None,
+            None,
+        )))
+        .unwrap();
+        app.pending = Some(rx);
+        app.poll();
+        assert!(app.library_available);
+    }
     #[test]
     fn failed_status_worker_revokes_verified_state_without_losing_disconnect() {
         let ctx = super::egui::Context::default();

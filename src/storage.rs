@@ -60,6 +60,35 @@ pub(crate) fn root() -> Result<PathBuf, String> {
         .ok_or_else(|| "LOCALAPPDATA NOT FOUND".into())
 }
 
+pub(crate) struct InstanceGuard(windows_sys::Win32::Foundation::HANDLE);
+impl InstanceGuard {
+    pub fn acquire(name: &str) -> Result<Option<Self>, String> {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError},
+            System::Threading::CreateMutexW,
+        };
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                CloseHandle(handle);
+                return Ok(None);
+            }
+            Ok(Some(Self(handle)))
+        }
+    }
+}
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 pub(crate) fn secure_directory(root: &Path) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let script = "$ErrorActionPreference='Stop'; $acl=New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetAccessRuleProtection($true,$false); foreach($sid in @([System.Security.Principal.WindowsIdentity]::GetCurrent().User, (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')), (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))) { $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $acl.AddAccessRule($rule) }; [System.IO.Directory]::SetAccessControl($env:NETT_STORAGE,$acl)";
@@ -111,6 +140,14 @@ pub fn load() -> Result<Option<PathBuf>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_one_instance_can_hold_the_store_guard() {
+        let name = format!("Local\\nett-test-{}", std::process::id());
+        let first = super::InstanceGuard::acquire(&name).unwrap().unwrap();
+        assert!(super::InstanceGuard::acquire(&name).unwrap().is_none());
+        drop(first);
+        assert!(super::InstanceGuard::acquire(&name).unwrap().is_some());
+    }
     #[test]
     fn dpapi_roundtrip_and_tampering() {
         let secret = b"PrivateKey=example-secret-key";

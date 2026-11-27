@@ -2,8 +2,8 @@ $ErrorActionPreference = 'Stop'
 $nettWorkspace = Split-Path $PSScriptRoot -Parent
 Set-Location $nettWorkspace
 $nettGo = Get-Command go -ErrorAction Stop
-if ((& $nettGo.Source version) -notmatch '^go version go1\.25\.5 ') {
-    throw 'Use Go 1.25.5, the toolchain pinned by the upstream source release.'
+if ((& $nettGo.Source version) -notmatch '^go version go1\.27\.4 ') {
+    throw 'Use Go 1.27.4, the toolchain pinned for the Nett security update.'
 }
 $nettSource = Join-Path $nettWorkspace 'vendor\amnezia-box-1.260910.0'
 if (-not (Test-Path -LiteralPath $nettSource)) {
@@ -23,5 +23,6 @@ $env:GOTOOLCHAIN = 'local'
 $env:GOWORK = 'off'
 $env:CGO_ENABLED = '0'
 Set-Location $nettSource
-& $nettGo.Source build -trimpath -tags with_gvisor,with_awg,with_wireguard,with_conntrack -ldflags '-s -w -X github.com/sagernet/sing-box/constant.Version=1.260910.0-nett.2' -o $nettOutput ./cmd/sing-box
+# shortcut: http2legacy preserves upstream's private HTTP/2 pool layout; remove when upstream uses public connection cleanup APIs.
+& $nettGo.Source build -mod=mod -trimpath -buildvcs=false -tags with_gvisor,with_awg,with_wireguard,with_conntrack,http2legacy -ldflags '-s -w -X github.com/sagernet/sing-box/constant.Version=1.260910.0-nett.3' -o $nettOutput ./cmd/sing-box
 if ($LASTEXITCODE -ne 0) { throw 'Split core build failed' }

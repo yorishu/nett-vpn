@@ -10,7 +10,7 @@
           [ tunnel terminal / windows x64 ]
 ```
 
-![build](https://img.shields.io/badge/build-1.0.0-9cff44?style=flat-square&labelColor=141d18)
+![build](https://img.shields.io/badge/build-1.0.1-9cff44?style=flat-square&labelColor=141d18)
 ![Rust](https://img.shields.io/badge/client-Rust-9cff44?style=flat-square&labelColor=141d18&logo=rust)
 ![Windows](https://img.shields.io/badge/platform-Windows_x64-9cff44?style=flat-square&labelColor=141d18)
 ![WG + AWG](https://img.shields.io/badge/tunnels-WireGuard_%2B_AmneziaWG-9cff44?style=flat-square&labelColor=141d18)
@@ -34,7 +34,7 @@ No browser shell. No Go installation needed to run it. VPN engines live beside t
 ## 01 // b00t
 
 ```text
-> download  nett-v1.0.0-windows-x64.zip
+> download  nett-v1.0.1-windows-x64.zip
 > extract   the whole archive
 > launch    nett.exe
 > import    your .conf
@@ -51,9 +51,9 @@ engines/
 README.md
 ```
 
-Normal AmneziaWG connections use the bundled official Windows engine. Normal WireGuard connections require [WireGuard for Windows](https://www.wireguard.com/install/). Enabling split tunneling selects the bundled Nett split core for either protocol.
+AmneziaWG connections always use the updated Nett core, including full tunnels with both split lists disabled. Normal WireGuard connections require [WireGuard for Windows](https://www.wireguard.com/install/); enabling split tunneling selects the bundled Nett core. The signed native AWG engine is retained only to stop legacy services during upgrades. It is not used for new AWG connections.
 
-Before upgrading, exit the previous copy through `qu1t`. Do not run two Nett instances against the same profile library.
+Before upgrading, exit the previous copy through `qu1t`. Nett prevents a second instance in the same Windows session and restores the existing window instead. Older versions do not have this guard.
 
 ## 02 // c0ntr0ls
 
@@ -112,7 +112,8 @@ Routing limits:
 - Peer `AllowedIPs` still apply. A local rule cannot grant access beyond the peer configuration.
 - Domain matching uses intercepted DNS or protocol sniffing. App-owned encrypted DNS and ECH can hide the domain; use IP/CIDR rules or adjust secure DNS in that app.
 - VPN DNS uses the first IP in the profile DNS list, or `1.1.1.1` when none exists. Direct DNS uses Windows. Shared Windows DNS services are not isolated per app.
-- The split AWG server endpoint needs an IPv4 address or hostname with an IPv4 DNS record. Nett resolves hostnames through Windows DNS before each connection, in the background. Unsupported config fields fail explicitly.
+- On IPv4-only uplinks, DNS rules for DIRECTLY sites return IPv4 addresses instead of advertising an unusable IPv6 path. Nett's own IPv6 tunnel route does not count as direct IPv6 connectivity. VPN DNS rules retain their existing strategy; systems with an external IPv6 default route keep dual-stack DNS. App-owned encrypted DNS and literal IPv6 addresses bypass this DNS policy.
+- WG/AWG server endpoints accept IPv4, bracketed IPv6 or a hostname. Nett resolves hostnames through Windows DNS before each connection in the background; AWG prefers IPv4 when available and accepts IPv6-only results. Unsupported config fields fail explicitly.
 
 ## 04 // l0cal vault
 
@@ -121,7 +122,7 @@ Routing limits:
 %LOCALAPPDATA%\nett-vpn\user-config.dpapi
 ```
 
-Both stores are encrypted with Windows DPAPI for the current account. `profiles.dpapi` contains only VPN profiles and the selected profile. `user-config.dpapi` contains global site/app rules, display preferences and kill-switch preference. Saving either store does not rewrite the other. Original import files are no longer needed; startup does not automatically connect.
+Both stores are encrypted with Windows DPAPI for the current account. `profiles.dpapi` contains only VPN profiles and the selected profile. `user-config.dpapi` contains global site/app rules, display preferences and kill-switch preference. Saving either store does not rewrite the other. Original import files are no longer needed; startup does not automatically connect. Failed vault loads disable editing so empty defaults cannot overwrite existing data; tray `qu1t` can still stop sessions using their separate runtime metadata. Working configs are staged only when connecting, not when loading or selecting a profile.
 
 On upgrade, the selected VPN profile's old routing rules become the global user rules (the first profile is used if none was selected). Existing user config always wins and is never replaced by migration. The complete original encrypted vault, including other profiles' old rule sets, is preserved as `profiles.before-user-config.dpapi`. The older single-profile format is also migrated automatically.
 
@@ -142,7 +143,7 @@ cargo test --release --locked
 
 For local use, extract `engines/` from a release beside `target/release/nett-vpn.exe`. Binaries, local profiles and build caches are excluded from Git.
 
-The split core is a Nett derivative of [Amnezia Box](https://github.com/amnezia-vpn/amnezia-box), pinned to `v1.260910.0`. To rebuild it, put Go **1.25.5** and Python on PATH:
+The split core is a Nett derivative of [Amnezia Box](https://github.com/amnezia-vpn/amnezia-box), pinned to `v1.260910.0`, with updated security dependencies. To rebuild it, put Go **1.27.4** and Python on PATH:
 
 ```powershell
 ./scripts/build_split_engine.ps1
@@ -152,6 +153,17 @@ cargo test --release --locked -- --include-ignored
 The script verifies the upstream archive checksum and applies the small lifecycle patch. Engine readiness includes PID and process creation time. A stop request calls the engine's normal cleanup path instead of abruptly killing it. Go is a build dependency for this sidecar only; Nett's UI stays Rust.
 
 The test suite covers encrypted persistence, routing config generation, UI clicks and layout, display changes during an active connection, tray lifecycle, failed verification and probe interface binding. Optional engine tests validate generated WG/AWG configs and start/stop a route-free instance. The two optional WFP tests require an elevated PowerShell: one aborts the complete filter transaction, the other blocks only a temporary localhost port and removes its rules automatically. Live VPN traffic and a complete real-server outage are not covered by these tests.
+
+After building the core, the encrypted roundtrip test uses two localhost peers and freshly generated test keys. It creates no system TUN or routes and never reads the user's VPN vault. Build its reference AWG peer from the patched module, then run the Python harness:
+
+```powershell
+$nettTestRoot = (Get-Location).Path
+New-Item -ItemType Directory -Force artifacts | Out-Null
+Push-Location vendor/amnezia-box-1.260910.0
+go build -trimpath -o "$nettTestRoot/artifacts/nett-awg-test-peer.exe" "$nettTestRoot/scripts/awg_test_peer.go"
+Pop-Location
+python scripts/test_split_roundtrip.py
+```
 
 Isolated screenshot mode never opens the real vault or creates a tray:
 

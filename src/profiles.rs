@@ -31,24 +31,76 @@ impl Profile {
         if std::fs::read_to_string(&path).ok().as_deref() != Some(&self.config) {
             std::fs::write(&path, &self.config).map_err(|e| e.to_string())?;
         }
-        super::detect_config(&path)?;
+        super::read_config(&path)?;
         Ok(path)
     }
     pub fn protocol(&self) -> super::Protocol {
-        if self.config.lines().any(|l| {
-            l.split_once('=').is_some_and(|(k, _)| {
-                [
-                    "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4", "i1",
-                    "i2", "i3", "i4", "i5",
-                ]
-                .contains(&k.trim().to_ascii_lowercase().as_str())
-            })
-        }) {
-            super::Protocol::AmneziaWg
-        } else {
-            super::Protocol::WireGuard
+        detect_protocol(&self.config)
+    }
+}
+
+pub(crate) fn detect_protocol(config: &str) -> super::Protocol {
+    let mut interface = false;
+    for raw in config.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            interface = line.eq_ignore_ascii_case("[Interface]");
+        }
+        if interface && let Some((key, _)) = line.split_once('=') {
+            if [
+                "jc",
+                "jmin",
+                "jmax",
+                "s1",
+                "s2",
+                "s3",
+                "s4",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "i1",
+                "i2",
+                "i3",
+                "i4",
+                "i5",
+                "randomtrailers",
+                "random_trailers",
+                "disablecookie",
+                "disable_cookie",
+                "disablecookies",
+                "disable_cookies",
+                "headerprotectionkey",
+                "header_protection_key",
+                "contentpaddingaddition",
+                "content_padding_addition",
+                "rekeyaftertime",
+                "rekey_after_time",
+                "rekeytimeout",
+                "rekey_timeout",
+                "rejectaftertime",
+                "reject_after_time",
+                "keepalivetimeout",
+                "keepalive_timeout",
+                "maxhandshakeattempts",
+                "max_handshake_attempts",
+            ]
+            .contains(&key.trim().to_ascii_lowercase().as_str())
+            {
+                return super::Protocol::AmneziaWg;
+            }
         }
     }
+    super::Protocol::WireGuard
+}
+
+pub(crate) fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 15
+        && !id.contains("..")
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_=+.-".contains(&b))
 }
 
 #[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -110,7 +162,7 @@ impl Library {
             .find(|p| Some(&p.id) == self.vpn.selected.as_ref())
     }
     pub fn import(&mut self, path: &Path) -> Result<(), String> {
-        super::detect_config(path)?;
+        let config = super::read_config(path)?;
         let id = format!(
             "n{:012x}",
             std::time::SystemTime::now()
@@ -128,27 +180,22 @@ impl Library {
                 .chars()
                 .take(64)
                 .collect(),
-            config: std::fs::read_to_string(path).map_err(|e| e.to_string())?,
+            config,
         });
         self.vpn.selected = Some(id);
         Ok(())
     }
     pub fn validate(&self) -> Result<(), String> {
         self.user.validate()?;
+        self.validate_vpn()
+    }
+    pub fn validate_vpn(&self) -> Result<(), String> {
         if self.vpn.profiles.len() > 100 {
             return Err("MAXIMUM 100 PROFILES".into());
         }
         let mut ids = std::collections::HashSet::new();
         for p in &self.vpn.profiles {
-            if p.id.is_empty()
-                || p.id.len() > 15
-                || !p
-                    .id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_=+.-".contains(&b))
-                || p.id.contains("..")
-                || !ids.insert(&p.id)
-            {
+            if !valid_id(&p.id) || !ids.insert(&p.id) {
                 return Err("INVALID OR DUPLICATE PROFILE ID".into());
             }
             if p.name.trim().is_empty()
@@ -167,7 +214,7 @@ impl Library {
         Ok(())
     }
     pub fn save_vpn(&self) -> Result<(), String> {
-        self.validate()?;
+        self.validate_vpn()?;
         let root = super::storage::root()?;
         super::storage::secure_directory(&root)?;
         save_encrypted(&root.join("profiles.dpapi"), &self.vpn)
@@ -311,6 +358,31 @@ fn save_encrypted(path: &Path, value: &impl Serialize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vpn_validation_is_independent_of_unsaved_user_rules() {
+        let mut library = library();
+        library.user.sites.entries.clear();
+        assert!(library.validate().is_err());
+        assert!(library.validate_vpn().is_ok());
+        library.vpn.selected = Some("missing".into());
+        assert!(library.validate_vpn().is_err());
+    }
+    #[test]
+    fn awg_optional_fields_identify_the_protocol_only_in_interface() {
+        for field in [
+            "I1",
+            "DisableCookies",
+            "RandomTrailers",
+            "HeaderProtectionKey",
+            "KeepaliveTimeout",
+        ] {
+            let text = format!("[Interface]\n{field}=\n[Peer]\nPublicKey=test");
+            assert!(detect_protocol(&text) == crate::Protocol::AmneziaWg);
+        }
+        assert!(
+            detect_protocol("[Interface]\n# Jc=4\n[Peer]\nI1=test") == crate::Protocol::WireGuard
+        );
+    }
     fn root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("nett-user-config-{name}-{}", std::process::id()))
     }
